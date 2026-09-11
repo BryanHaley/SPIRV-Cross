@@ -240,7 +240,9 @@ set(spirv-cross-cpp-sources
 
 set(spirv-cross-msl-sources
 		${CMAKE_CURRENT_SOURCE_DIR}/spirv_msl.cpp
-		${CMAKE_CURRENT_SOURCE_DIR}/spirv_msl.hpp)
+		${CMAKE_CURRENT_SOURCE_DIR}/spirv_msl.hpp
+		${CMAKE_CURRENT_SOURCE_DIR}/spirv_msl_fp64.cpp
+		${CMAKE_CURRENT_SOURCE_DIR}/spirv_msl_fp64.hpp)
 
 set(spirv-cross-hlsl-sources
 		${CMAKE_CURRENT_SOURCE_DIR}/spirv_hlsl.cpp

@@ -683,6 +683,7 @@ struct CLIArguments
 	bool msl_replace_recursive_inputs = false;
 	bool msl_readwrite_texture_fences = true;
 	bool msl_agx_manual_cube_grad_fixup = false;
+	const char *msl_fp64_mode = nullptr;
 	bool msl_input_attachment_is_ds_attachment = false;
 	bool msl_disable_rasterization = false;
 	bool msl_auto_disable_rasterization = false;
@@ -1308,6 +1309,15 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.input_attachment_is_ds_attachment = args.msl_input_attachment_is_ds_attachment;
 		msl_opts.readwrite_texture_fences = args.msl_readwrite_texture_fences;
 		msl_opts.agx_manual_cube_grad_fixup = args.msl_agx_manual_cube_grad_fixup;
+		if (args.msl_fp64_mode)
+		{
+			if (strcmp(args.msl_fp64_mode, "double") == 0)
+				msl_opts.fp64_mode = FP64Mode::DoubleFloat;
+			else if (strcmp(args.msl_fp64_mode, "triple") == 0)
+				msl_opts.fp64_mode = FP64Mode::TripleFloat;
+			else
+				fprintf(stderr, "Unknown fp64 mode: %s. Use 'double' or 'triple'.\n", args.msl_fp64_mode);
+		}
 		msl_opts.disable_rasterization = args.msl_disable_rasterization;
 		msl_opts.auto_disable_rasterization = args.msl_auto_disable_rasterization;
 		msl_opts.enable_point_size_default = args.msl_enable_point_size_default;
@@ -1909,6 +1919,7 @@ static int main_inner(int argc, char *argv[])
 	        [&args](CLIParser &) { args.msl_sample_dref_lod_array_as_grad = true; });
 	cbs.add("--msl-no-readwrite-texture-fences", [&args](CLIParser &) { args.msl_readwrite_texture_fences = false; });
 	cbs.add("--msl-agx-manual-cube-grad-fixup", [&args](CLIParser &) { args.msl_agx_manual_cube_grad_fixup = true; });
+	cbs.add("--msl-fp64-mode", [&args](CLIParser &parser) { args.msl_fp64_mode = parser.next_string(); });
 	cbs.add("--msl-combined-sampler-suffix", [&args](CLIParser &parser) {
 		args.msl_combined_sampler_suffix = parser.next_string();
 	});

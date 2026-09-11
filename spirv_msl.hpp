@@ -25,6 +25,7 @@
 #define SPIRV_CROSS_MSL_HPP
 
 #include "spirv_glsl.hpp"
+#include "spirv_msl_fp64.hpp"
 #include <map>
 #include <set>
 #include <stddef.h>
@@ -551,6 +552,11 @@ public:
 		// Requires MSL 3.2 or above, and has no effect with earlier MSL versions.
 		bool use_fast_math_pragmas = false;
 
+		// Emulate fp64 (double) using float-based multi-term representations.
+		// Default Disabled so existing reference tests are unchanged.
+		// IMPORTANT: generated MSL must be compiled with MTLMathModeSafe.
+		FP64Mode fp64_mode = FP64Mode::Disabled;
+
 		bool is_ios() const
 		{
 			return platform == iOS;
@@ -920,6 +926,7 @@ protected:
 	void emit_spv_amd_shader_trinary_minmax_op(uint32_t result_type, uint32_t result_id, uint32_t op,
 	                                           const uint32_t *args, uint32_t count) override;
 	void emit_header() override;
+	std::string constant_expression_vector(const SPIRConstant &c, uint32_t vector) override;
 	void emit_function_prototype(SPIRFunction &func, const Bitset &return_flags) override;
 	void emit_sampled_image_op(uint32_t result_type, uint32_t result_id, uint32_t image_id, uint32_t samp_id) override;
 	void emit_subgroup_op(const Instruction &i) override;
@@ -999,6 +1006,7 @@ protected:
 	void localize_global_variables();
 	void extract_global_variables_from_functions();
 	void mark_packable_structs();
+	void mark_fp64_struct_members();
 	void mark_as_packable(SPIRType &type);
 	void mark_as_workgroup_struct(SPIRType &type);
 

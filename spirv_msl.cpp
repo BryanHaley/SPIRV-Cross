@@ -1828,6 +1828,7 @@ string CompilerMSL::compile()
 
 	// Mark any non-stage-in structs to be tightly packed.
 	mark_packable_structs();
+	mark_fp64_struct_members();
 	reorder_type_alias();
 
 	// Add fixup hooks required by shader inputs and outputs. This needs to happen before
@@ -2523,6 +2524,55 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 
 // For all variables that are some form of non-input-output interface block, mark that all the structs
 // that are recursively contained within the type referenced by that variable should be packed tightly.
+
+// A double kept in a struct stays in its IEEE binary64 layout: eight bytes,
+// declared as uint2 with the low word first. The value form is a float triple,
+// so loads decode and stores encode. Without this a host that writes real
+// doubles into a buffer would be read back as three unrelated floats.
+void CompilerMSL::mark_fp64_struct_members()
+{
+	if (msl_options.fp64_mode == FP64Mode::Disabled)
+		return;
+
+	SmallVector<uint32_t> struct_ids;
+
+	ir.for_each_typed_id<SPIRType>([&](uint32_t id, SPIRType &type) {
+		if (type.basetype == SPIRType::Struct && !type.pointer && type.self == ID(id))
+			struct_ids.push_back(id);
+	});
+
+	for (uint32_t struct_id : struct_ids)
+	{
+		auto &type = get<SPIRType>(struct_id);
+
+		for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
+		{
+			auto &mbr_type = get<SPIRType>(type.member_types[i]);
+
+			if (mbr_type.basetype != SPIRType::Double)
+				continue;
+
+			// dvec and dmat already refuse earlier; this is the scalar case
+			if (mbr_type.vecsize > 1 || mbr_type.columns > 1)
+				continue;
+
+			if (has_extended_member_decoration(struct_id, i, SPIRVCrossDecorationPhysicalTypeID))
+				continue;
+
+			auto storage_type = mbr_type;
+			storage_type.basetype = SPIRType::UInt;
+			storage_type.width = 32;
+			storage_type.vecsize = 2;
+			storage_type.columns = 1;
+			storage_type.parent_type = 0;
+
+			uint32_t type_id = ir.increase_bound_by(1);
+			set<SPIRType>(type_id, storage_type);
+			set_extended_member_decoration(struct_id, i, SPIRVCrossDecorationPhysicalTypeID, type_id);
+		}
+	}
+}
+
 void CompilerMSL::mark_packable_structs()
 {
 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
@@ -5424,6 +5474,16 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 
 	bool transpose = lhs_e && lhs_e->need_transpose;
 
+	// Writing a double back into its binary64 slot.
+	if (msl_options.fp64_mode != FP64Mode::Disabled && lhs_remapped_type &&
+	    type.basetype == SPIRType::Double)
+	{
+		statement(to_expression(lhs_expression), " = ", get_fp64_encode_name(msl_options.fp64_mode), "(",
+		          to_unpacked_expression(rhs_expression), ");");
+		register_write(lhs_expression);
+		return;
+	}
+
 	if (has_decoration(lhs_expression, DecorationBuiltIn) &&
 	    BuiltIn(get_decoration(lhs_expression, DecorationBuiltIn)) == BuiltInSampleMask &&
 	    is_array(type))
@@ -5694,6 +5754,14 @@ string CompilerMSL::unpack_expression_type(string expr_str, const SPIRType &type
 	const SPIRType *physical_type = nullptr;
 	if (physical_type_id)
 		physical_type = &get<SPIRType>(physical_type_id);
+
+	// An emulated double is stored as its raw binary64 bits; turn them back
+	// into the float form the arithmetic works on.
+	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double &&
+	    physical_type && physical_type->basetype == SPIRType::UInt && physical_type->vecsize == 2)
+	{
+		return join(get_fp64_decode_name(msl_options.fp64_mode), "(", expr_str, ")");
+	}
 
 	static const char *swizzle_lut[] = {
 		".x",
@@ -6036,8 +6104,57 @@ void CompilerMSL::emit_custom_templates()
 // Emits any needed custom function bodies.
 // Metal helper functions must be static force-inline, i.e. static inline __attribute__((always_inline))
 // otherwise they will cause problems when linked together in a single Metallib.
+// Override constant expression generation for fp64 constants.
+// Splits IEEE double literals into their float components at translation time.
+std::string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint32_t vector)
+{
+	auto &type = get<SPIRType>(c.constant_type);
+	if (type.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+	{
+		// Split the double value into float components
+		float x, y, z;
+		double value = c.scalar_f64(vector, 0);
+		if (msl_options.fp64_mode == FP64Mode::TripleFloat)
+		{
+			split_double_tf(value, x, y, z);
+			// Format with enough precision
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%s{%.9e, %.9e, %.9e}",
+			         get_fp64_type_name(msl_options.fp64_mode), x, y, z);
+			return std::string(buf);
+		}
+		else
+		{
+			split_double_df(value, x, y);
+			char buf[256];
+			snprintf(buf, sizeof(buf), "%s{%.9e, %.9e}",
+			         get_fp64_type_name(msl_options.fp64_mode), x, y);
+			return std::string(buf);
+		}
+	}
+	return CompilerGLSL::constant_expression_vector(c, vector);
+}
+
 void CompilerMSL::emit_custom_functions()
 {
+	// Emit fp64 emulation prelude if enabled, and only if the module has a
+	// double in it. Otherwise every shader in the program carries 185 lines of
+	// arithmetic it never calls.
+	bool module_uses_fp64 = false;
+	if (msl_options.fp64_mode != FP64Mode::Disabled)
+	{
+		ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &t) {
+			if (t.basetype == SPIRType::Double)
+				module_uses_fp64 = true;
+		});
+	}
+
+	if (module_uses_fp64)
+	{
+		statement(get_fp64_msl_prelude(msl_options.fp64_mode));
+		statement("");
+	}
+
 	// Use when outputting overloaded functions to cover different address spaces.
 	static const char *texture_addr_spaces[] = { "device", "constant", "thread" };
 	static uint32_t texture_addr_space_count = sizeof(texture_addr_spaces) / sizeof(char*);
@@ -9508,6 +9625,17 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	auto int_type = to_signed_basetype(integer_width);
 	auto uint_type = to_unsigned_basetype(integer_width);
 
+	// FP64 emulation helper: check if a type is emulated double
+	auto is_fp64 = [this](uint32_t type_id) -> bool {
+		return msl_options.fp64_mode != FP64Mode::Disabled &&
+		       get<SPIRType>(type_id).basetype == SPIRType::Double;
+	};
+	// Helper: check if an expression is of fp64 type
+	auto expr_is_fp64 = [this](uint32_t expr_id) -> bool {
+		return msl_options.fp64_mode != FP64Mode::Disabled &&
+		       expression_type(expr_id).basetype == SPIRType::Double;
+	};
+
 	switch (opcode)
 	{
 	case OpLoad:
@@ -9557,7 +9685,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpLogicalEqual:
 	case OpFOrdEqual:
-		MSL_BOP(==);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("eq", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(==);
 		break;
 
 	case OpINotEqual:
@@ -9566,11 +9700,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpLogicalNotEqual:
 	case OpFOrdNotEqual:
-		// TODO: Should probably negate the == result here.
-		// Typically OrdNotEqual comes from GLSL which itself does not really specify what
-		// happens with NaN.
-		// Consider fixing this if we run into real issues.
-		MSL_BOP(!=);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("ne", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(!=);
 		break;
 
 	case OpUGreaterThan:
@@ -9582,7 +9718,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdGreaterThan:
-		MSL_BOP(>);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("gt", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(>);
 		break;
 
 	case OpUGreaterThanEqual:
@@ -9594,7 +9736,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdGreaterThanEqual:
-		MSL_BOP(>=);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("ge", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(>=);
 		break;
 
 	case OpULessThan:
@@ -9606,7 +9754,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdLessThan:
-		MSL_BOP(<);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("lt", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(<);
 		break;
 
 	case OpULessThanEqual:
@@ -9618,32 +9772,48 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFOrdLessThanEqual:
-		MSL_BOP(<=);
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("le", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(<=);
 		break;
 
 	case OpFUnordEqual:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_UNORD_BOP(==);
 		break;
 
 	case OpFUnordNotEqual:
-		// not equal in MSL generates une opcodes to begin with.
-		// Since unordered not equal is how it works in C, just inherit that behavior.
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_BOP(!=);
 		break;
 
 	case OpFUnordGreaterThan:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_UNORD_BOP(>);
 		break;
 
 	case OpFUnordGreaterThanEqual:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_UNORD_BOP(>=);
 		break;
 
 	case OpFUnordLessThan:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_UNORD_BOP(<);
 		break;
 
 	case OpFUnordLessThanEqual:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
 		MSL_UNORD_BOP(<=);
 		break;
 
@@ -9720,31 +9890,70 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFRem:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: OpFRem on double is not implemented.");
 		MSL_BFOP(fmod);
 		break;
 
+	case OpFNegate:
+		if (is_fp64(ops[0]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_func_name("neg", msl_options.fp64_mode));
+		}
+		else
+			MSL_UOP(-);
+		break;
+
 	case OpFMul:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("mul", msl_options.fp64_mode));
+		}
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFMul);
 		else
 			MSL_BOP(*);
 		break;
 
 	case OpFAdd:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("add", msl_options.fp64_mode));
+		}
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFAdd);
 		else
 			MSL_BOP(+);
 		break;
 
 	case OpFSub:
-		if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("sub", msl_options.fp64_mode));
+		}
+		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFSub);
 		else
 			MSL_BOP(-);
 		break;
 
+	case OpFDiv:
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                   get_fp64_func_name("div", msl_options.fp64_mode));
+		}
+		else
+			MSL_BOP(/);
+		break;
+
 	case OpFmaKHR:
+		if (is_fp64(ops[0]))
+			SPIRV_CROSS_THROW("fp64 emulation: Fma on double is not implemented.");
 		MSL_TFOP(fma);
 		break;
 
@@ -10466,6 +10675,78 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		if (!msl_options.supports_msl_version(2, 0))
 			SPIRV_CROSS_THROW("Raster order groups require MSL 2.0.");
 		break; // Nothing to do in the body
+
+	case OpFConvert:
+		// ops[2] is a value, not a type -- asking get<SPIRType> for it throws
+		if (is_fp64(ops[0]) || expr_is_fp64(ops[2]))
+		{
+			// fp64 <-> float conversion
+			auto &res_type = get<SPIRType>(ops[0]);
+			auto &arg_type = expression_type(ops[2]);
+			if (res_type.basetype == SPIRType::Double)
+			{
+				// converting TO fp64
+				if (arg_type.basetype == SPIRType::Float)
+					emit_unary_func_op(ops[0], ops[1], ops[2],
+					                   get_fp64_convert_name("float", "double", msl_options.fp64_mode));
+				else
+					SPIRV_CROSS_THROW("fp64 emulation: FConvert to double from non-float not implemented.");
+			}
+			else
+			{
+				// converting FROM fp64
+				if (res_type.basetype == SPIRType::Float)
+					emit_unary_func_op(ops[0], ops[1], ops[2],
+					                   get_fp64_convert_name("double", "float", msl_options.fp64_mode));
+				else
+					SPIRV_CROSS_THROW("fp64 emulation: FConvert from double to non-float not implemented.");
+			}
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpConvertSToF:
+		if (is_fp64(ops[0]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_convert_name("int", "double", msl_options.fp64_mode));
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpConvertUToF:
+		if (is_fp64(ops[0]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_convert_name("uint", "double", msl_options.fp64_mode));
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpConvertFToS:
+		// ops[2] is the value being converted, not a type id
+		if (expr_is_fp64(ops[2]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_convert_name("double", "int", msl_options.fp64_mode));
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
+
+	case OpConvertFToU:
+		// ops[2] is the value being converted, not a type id
+		if (expr_is_fp64(ops[2]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_convert_name("double", "uint", msl_options.fp64_mode));
+		}
+		else
+			CompilerGLSL::emit_instruction(instruction);
+		break;
 
 	case OpConvertUToAccelerationStructureKHR:
 		SPIRV_CROSS_THROW("ConvertUToAccelerationStructure is not supported in MSL.");
@@ -11702,6 +11983,7 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 
 	switch (op)
 	{
+	// fp64 Sqrt and InverseSqrt before the precise override macros
 	EMIT_PRECISE_OVERRIDE(Cos, "cos");
 	EMIT_PRECISE_OVERRIDE(Sin, "sin");
 	EMIT_PRECISE_OVERRIDE(Tan, "tan");
@@ -11712,8 +11994,17 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 	EMIT_PRECISE_OVERRIDE(Exp2, "exp2");
 	EMIT_PRECISE_OVERRIDE(Log, "log");
 	EMIT_PRECISE_OVERRIDE(Log2, "log2");
-	EMIT_PRECISE_OVERRIDE(Sqrt, "sqrt");
 #undef EMIT_PRECISE_OVERRIDE
+
+	case GLSLstd450Sqrt:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("sqrt", msl_options.fp64_mode));
+		else if (restype.basetype == SPIRType::Float && preserve_nan)
+			emit_unary_func_op(result_type, id, args[0], "precise::sqrt");
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
 
 	case GLSLstd450Sinh:
 		if (restype.basetype == SPIRType::Half)
@@ -11786,9 +12077,56 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 			emit_unary_func_op(result_type, id, args[0], "rsqrt");
 		break;
 	case GLSLstd450RoundEven:
-		emit_unary_func_op(result_type, id, args[0], "rint");
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("roundeven", msl_options.fp64_mode));
+		else
+			emit_unary_func_op(result_type, id, args[0], "rint");
 		break;
 
+	// fp64 GLSL std450 ops
+	case GLSLstd450FAbs:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("abs", msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
+	case GLSLstd450FSign:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_sign_name(msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
+	case GLSLstd450Floor:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("floor", msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
+	case GLSLstd450Ceil:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("ceil", msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
+	case GLSLstd450Trunc:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("trunc", msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
+	case GLSLstd450Round:
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_unary_func_op(result_type, id, args[0],
+			                   get_fp64_func_name("round", msl_options.fp64_mode));
+		else
+			CompilerGLSL::emit_glsl_op(result_type, id, eop, args, count);
+		break;
 	case GLSLstd450FindILsb:
 	{
 		// In this template version of findLSB, we return T.
@@ -11878,14 +12216,20 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 		// If the result type isn't float, don't bother calling the specific
 		// precise::/fast:: version. Metal doesn't have those for half and
 		// double types.
-		if (get<SPIRType>(result_type).basetype != SPIRType::Float)
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                   get_fp64_func_name("min", msl_options.fp64_mode));
+		else if (restype.basetype != SPIRType::Float)
 			emit_binary_func_op(result_type, id, args[0], args[1], "min");
 		else
 			emit_binary_func_op(result_type, id, args[0], args[1], "fast::min");
 		break;
 
 	case GLSLstd450FMax:
-		if (get<SPIRType>(result_type).basetype != SPIRType::Float)
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                   get_fp64_func_name("max", msl_options.fp64_mode));
+		else if (restype.basetype != SPIRType::Float)
 			emit_binary_func_op(result_type, id, args[0], args[1], "max");
 		else
 			emit_binary_func_op(result_type, id, args[0], args[1], "fast::max");
@@ -11893,21 +12237,29 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 
 	case GLSLstd450FClamp:
 		// TODO: If args[1] is 0 and args[2] is 1, emit a saturate() call.
-		if (get<SPIRType>(result_type).basetype != SPIRType::Float)
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			SPIRV_CROSS_THROW("fp64 emulation: GLSLstd450FClamp on double is not implemented.");
+		if (restype.basetype != SPIRType::Float)
 			emit_trinary_func_op(result_type, id, args[0], args[1], args[2], "clamp");
 		else
 			emit_trinary_func_op(result_type, id, args[0], args[1], args[2], "fast::clamp");
 		break;
 
 	case GLSLstd450NMin:
-		if (get<SPIRType>(result_type).basetype != SPIRType::Float)
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                   get_fp64_func_name("min", msl_options.fp64_mode));
+		else if (restype.basetype != SPIRType::Float)
 			emit_binary_func_op(result_type, id, args[0], args[1], "min");
 		else
 			emit_binary_func_op(result_type, id, args[0], args[1], "precise::min");
 		break;
 
 	case GLSLstd450NMax:
-		if (get<SPIRType>(result_type).basetype != SPIRType::Float)
+		if (restype.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                   get_fp64_func_name("max", msl_options.fp64_mode));
+		else if (restype.basetype != SPIRType::Float)
 			emit_binary_func_op(result_type, id, args[0], args[1], "max");
 		else
 			emit_binary_func_op(result_type, id, args[0], args[1], "precise::max");
@@ -17233,7 +17585,21 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 		type_name = "float";
 		break;
 	case SPIRType::Double:
-		type_name = "double"; // Currently unsupported
+		if (msl_options.fp64_mode != FP64Mode::Disabled)
+		{
+			// A double is a struct of floats here, so the vector and matrix
+			// forms would need per-component lowering that does not exist yet.
+			// Saying so is better than emitting MSL that Metal rejects with a
+			// message about a type the shader author never wrote.
+			if (type.columns > 1)
+				SPIRV_CROSS_THROW("fp64 emulation: dmat types are not implemented.");
+			if (type.vecsize > 1)
+				SPIRV_CROSS_THROW("fp64 emulation: dvec types are not implemented.");
+
+			type_name = get_fp64_type_name(msl_options.fp64_mode);
+		}
+		else
+			type_name = "double"; // Currently unsupported
 		break;
 	case SPIRType::BFloat16:
 		if (!msl_options.supports_msl_version(3, 1))
@@ -18934,6 +19300,8 @@ uint32_t CompilerMSL::get_declared_type_alignment_msl(TypeID type_id, const SPIR
 		SPIRV_CROSS_THROW("Querying alignment of opaque object.");
 
 	case SPIRType::Double:
+		if (msl_options.fp64_mode != FP64Mode::Disabled)
+			return 8; // Stored as uint2 (2x uint32, 8 bytes) matching IEEE double size
 		SPIRV_CROSS_THROW("double types are not supported in buffers in MSL.");
 
 	case SPIRType::Struct:
