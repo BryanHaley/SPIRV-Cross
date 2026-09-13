@@ -1007,6 +1007,9 @@ protected:
 	void extract_global_variables_from_functions();
 	void mark_packable_structs();
 	void mark_fp64_struct_members();
+	// Non-zero when this variable lives in a stage interface block as an
+	// emulated double, i.e. declared uint2 but written as MGLtf.
+	uint32_t fp64_interface_storage_type(uint32_t var_id) const;
 	void mark_as_packable(SPIRType &type);
 	void mark_as_workgroup_struct(SPIRType &type);
 

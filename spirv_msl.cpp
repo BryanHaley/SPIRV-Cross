@@ -5463,6 +5463,52 @@ void CompilerMSL::ensure_member_packing_rules_msl(SPIRType &ib_type, uint32_t in
 		SPIRV_CROSS_THROW("Found a buffer packing case which we cannot represent in MSL.");
 }
 
+// A double that reaches a stage interface is declared as its raw binary64 bits,
+// because Metal will not carry a struct between stages. The emulation works on
+// MGLtf, so a store or load across that boundary has to encode or decode.
+uint32_t CompilerMSL::fp64_interface_storage_type(uint32_t var_id) const
+{
+	if (msl_options.fp64_mode == FP64Mode::Disabled)
+		return 0;
+
+	auto *var = maybe_get<SPIRVariable>(var_id);
+	if (!var)
+		return 0;
+
+	if (var->storage != spv::StorageClassOutput && var->storage != spv::StorageClassInput)
+		return 0;
+
+	uint32_t ib_var_id = (var->storage == spv::StorageClassOutput) ? stage_out_var_id : stage_in_var_id;
+	if (!ib_var_id)
+		return 0;
+
+	auto *ib_var = maybe_get<SPIRVariable>(ib_var_id);
+	if (!ib_var)
+		return 0;
+
+	auto &ib_type = get_variable_element_type(*ib_var);
+
+	// The interface struct remembers which variable each member came from.
+	for (uint32_t i = 0; i < uint32_t(ib_type.member_types.size()); i++)
+	{
+		if (get_extended_member_decoration(ib_type.self, i, SPIRVCrossDecorationInterfaceOrigID) != var_id)
+			continue;
+
+		if (!has_extended_member_decoration(ib_type.self, i, SPIRVCrossDecorationPhysicalTypeID))
+			return 0;
+
+		uint32_t phys_id = get_extended_member_decoration(ib_type.self, i, SPIRVCrossDecorationPhysicalTypeID);
+		auto &phys = get<SPIRType>(phys_id);
+
+		if (phys.basetype != SPIRType::UInt || phys.vecsize != 2)
+			return 0;
+
+		return phys_id;
+	}
+
+	return 0;
+}
+
 void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_expression)
 {
 	auto &type = expression_type(rhs_expression);
@@ -5475,8 +5521,8 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 	bool transpose = lhs_e && lhs_e->need_transpose;
 
 	// Writing a double back into its binary64 slot.
-	if (msl_options.fp64_mode != FP64Mode::Disabled && lhs_remapped_type &&
-	    type.basetype == SPIRType::Double)
+	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double &&
+	    (lhs_remapped_type || fp64_interface_storage_type(lhs_expression) != 0))
 	{
 		statement(to_expression(lhs_expression), " = ", get_fp64_encode_name(msl_options.fp64_mode), "(",
 		          to_unpacked_expression(rhs_expression), ");");
