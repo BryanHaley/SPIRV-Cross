@@ -13742,6 +13742,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		break;
 
 	case Dim2D:
+	// MODIFIED (The Moogle Project): a rectangle texture reaches Metal as a 2D
+	// texture with an unnormalised sampler, so its coordinates convert the same
+	// way a 2D texture's do.
+	case DimRect:
 		if (coord_type.vecsize > 2)
 			tex_coords = enclose_expression(tex_coords) + ".xy";
 
@@ -18626,6 +18630,9 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 		break;
 	case Dim1D:
 	case Dim2D:
+	// MODIFIED (The Moogle Project): a rectangle texture is a 2D texture that
+	// takes unnormalised coordinates, and Metal has no separate type for it.
+	case DimRect:
 	case DimSubpassData:
 	{
 		bool subpass_array =
