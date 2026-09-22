@@ -7,6 +7,8 @@
 #include <cmath>
 #include <cstring>
 #include <cstdio>
+#include <functional>
+#include <vector>
 
 namespace SPIRV_CROSS_NAMESPACE
 {
@@ -178,10 +180,6 @@ static inline uint2 MGLdf_encode(MGLdf v) {
     return uint2(uint(bits & 0xFFFFFFFFul), uint(bits >> 32));
 }
 
-// ---- Vector types ----
-struct MGLdf2 { MGLdf x, y; };
-struct MGLdf3 { MGLdf x, y, z; };
-struct MGLdf4 { MGLdf x, y, z, w; };
 )";
 
 // ===================================================================
@@ -430,11 +428,603 @@ static inline uint2 MGLtf_encode(MGLtf v) {
     return uint2(uint(bits & 0xFFFFFFFFul), uint(bits >> 32));
 }
 
-// ---- Vector types ----
-struct MGLtf2 { MGLtf x, y; };
-struct MGLtf3 { MGLtf x, y, z; };
-struct MGLtf4 { MGLtf x, y, z, w; };
 )";
+
+// ---------------------------------------------------------------------------
+// Vectors and matrices
+//
+// An emulated double is a struct, so a dvec is a struct of those and a dmat a
+// struct of columns. Metal has no operators for them, so every GLSL operation
+// becomes a call, one component at a time. All of it is written out here
+// rather than kept as a fixed string, because the same twelve lines would
+// otherwise be repeated for every width.
+// ---------------------------------------------------------------------------
+
+static const char *comp_name(uint32_t i)
+{
+	static const char *names[] = { "x", "y", "z", "w" };
+	return names[i];
+}
+
+std::string get_fp64_composite_type_name(FP64Mode mode, uint32_t vecsize, uint32_t columns)
+{
+	const char *base = get_fp64_type_name(mode);
+	if (!base)
+		return {};
+
+	std::string name = base;
+	if (columns > 1)
+		name += std::to_string(columns) + "x";
+	if (vecsize > 1)
+		name += std::to_string(vecsize);
+	return name;
+}
+
+namespace
+{
+// Builds MSL call expressions so the generators below read like the maths.
+struct Emitter
+{
+	std::string P;    // the scalar type, MGLtf or MGLdf
+	std::string out;
+
+	void line(const std::string &s) { out += s; out += "\n"; }
+
+	std::string call(const std::string &fn, const std::string &a) const { return P + "_" + fn + "(" + a + ")"; }
+	std::string call(const std::string &fn, const std::string &a, const std::string &b) const
+	{
+		return P + "_" + fn + "(" + a + ", " + b + ")";
+	}
+	std::string call(const std::string &fn, const std::string &a, const std::string &b, const std::string &c) const
+	{
+		return P + "_" + fn + "(" + a + ", " + b + ", " + c + ")";
+	}
+	std::string add(const std::string &a, const std::string &b) const { return call("add", a, b); }
+	std::string sub(const std::string &a, const std::string &b) const { return call("sub", a, b); }
+	std::string mul(const std::string &a, const std::string &b) const { return call("mul", a, b); }
+	std::string div(const std::string &a, const std::string &b) const { return call("div", a, b); }
+	std::string neg(const std::string &a) const { return call("neg", a); }
+	std::string lit(float v) const
+	{
+		char buf[64];
+		snprintf(buf, sizeof(buf), "%s_from_float(%.1ff)", P.c_str(), v);
+		return buf;
+	}
+
+	std::string vec(uint32_t n) const { return n > 1 ? P + std::to_string(n) : P; }
+	std::string mat(uint32_t cols, uint32_t rows) const
+	{
+		return P + std::to_string(cols) + "x" + std::to_string(rows);
+	}
+	// component i of a value that may be a scalar (then there is one component)
+	std::string at(const std::string &v, uint32_t i, uint32_t n) const
+	{
+		return n > 1 ? v + "." + comp_name(i) : v;
+	}
+	std::string col(const std::string &m, uint32_t i) const { return m + ".c" + std::to_string(i); }
+
+	// Wraps per-component expressions in a constructor for the result width.
+	std::string build(uint32_t n, const std::vector<std::string> &parts) const
+	{
+		if (n == 1)
+			return parts[0];
+		std::string s = vec(n) + "{";
+		for (uint32_t i = 0; i < n; i++)
+			s += (i ? ", " : "") + parts[i];
+		return s + "}";
+	}
+	std::string buildMat(uint32_t cols, uint32_t rows, const std::vector<std::string> &parts) const
+	{
+		std::string s = mat(cols, rows) + "{";
+		for (uint32_t i = 0; i < cols; i++)
+			s += (i ? ", " : "") + parts[i];
+		return s + "}";
+	}
+};
+} // namespace
+
+std::string get_fp64_composite_prelude(FP64Mode mode, bool want_matrices)
+{
+	if (mode == FP64Mode::Disabled)
+		return {};
+
+	Emitter e;
+	e.P = get_fp64_type_name(mode);
+	const std::string &P = e.P;
+
+	// ---- scalar operations the fixed prelude does not carry ----
+	e.line("// ---- Scalar operations built on the primitives above ----");
+	e.line("static inline " + P + " " + P + "_fract(" + P + " a) { return " + e.sub("a", e.call("floor", "a")) +
+	       "; }");
+	e.line("static inline " + P + " " + P + "_mod(" + P + " a, " + P + " b) { return " +
+	       e.sub("a", e.mul("b", e.call("floor", e.div("a", "b")))) + "; }");
+	// GLSL's mod floors; C's fmod truncates. SPIR-V has an opcode for each.
+	e.line("static inline " + P + " " + P + "_rem(" + P + " a, " + P + " b) { return " +
+	       e.sub("a", e.mul("b", e.call("trunc", e.div("a", "b")))) + "; }");
+	e.line("static inline " + P + " " + P + "_inversesqrt(" + P + " a) { return " +
+	       e.div(e.lit(1.0f), e.call("sqrt", "a")) + "; }");
+	e.line("static inline " + P + " " + P + "_mix(" + P + " a, " + P + " b, " + P + " t) { return " +
+	       e.add("a", e.mul(e.sub("b", "a"), "t")) + "; }");
+	e.line("static inline " + P + " " + P + "_clamp(" + P + " a, " + P + " lo, " + P + " hi) { return " +
+	       e.call("min", e.call("max", "a", "lo"), "hi") + "; }");
+	e.line("static inline " + P + " " + P + "_step(" + P + " edge, " + P + " a) { return " + P +
+	       "_lt(a, edge) ? " + e.lit(0.0f) + " : " + e.lit(1.0f) + "; }");
+	e.line("static inline " + P + " " + P + "_smoothstep(" + P + " e0, " + P + " e1, " + P + " a) {");
+	e.line("    " + P + " t = " + e.call("clamp", e.div(e.sub("a", "e0"), e.sub("e1", "e0")), e.lit(0.0f),
+	                                     e.lit(1.0f)) + ";");
+	e.line("    return " + e.mul(e.mul("t", "t"), e.sub(e.lit(3.0f), e.mul(e.lit(2.0f), "t"))) + "; }");
+	e.line("static inline " + P + " " + P + "_fma(" + P + " a, " + P + " b, " + P + " c) { return " +
+	       e.add(e.mul("a", "b"), "c") + "; }");
+	// A value is the sum of its terms, so the leading term decides these.
+	e.line("static inline bool " + P + "_isnan(" + P + " a) { return isnan(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
+	e.line("static inline bool " + P + "_isinf(" + P + " a) { return isinf(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
+	if (mode == FP64Mode::TripleFloat)
+	{
+		e.line("static inline " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
+		       "_canon(" + P + "{ldexp(a.x, n), ldexp(a.y, n), ldexp(a.z, n)}); }");
+		e.line("static inline " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
+		e.line("    if (a.x == 0.0f) { n = 0; return a; }");
+		e.line("    n = ilogb(a.x) + 1;");
+		e.line("    return " + P + "_ldexp(a, -n); }");
+	}
+	else
+	{
+		e.line("static inline " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
+		       "{ldexp(a.hi, n), ldexp(a.lo, n)}; }");
+		e.line("static inline " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
+		e.line("    if (a.hi == 0.0f) { n = 0; return a; }");
+		e.line("    n = ilogb(a.hi) + 1;");
+		e.line("    return " + P + "_ldexp(a, -n); }");
+	}
+	e.line("static inline " + P + " " + P + "_modf(" + P + " a, thread " + P + " &ip) {");
+	e.line("    ip = " + e.call("trunc", "a") + "; return " + e.sub("a", "ip") + "; }");
+	// The unordered forms are true whenever either side is a NaN. Unordered
+	// not-equal needs no wrapper: not-equal already answers true there.
+	for (const char *c : { "eq", "lt", "le", "gt", "ge" })
+		e.line("static inline bool " + P + "_un_" + c + "(" + P + " a, " + P + " b) { return " + P +
+		       "_isnan(a) || " + P + "_isnan(b) || " + P + "_" + c + "(a, b); }");
+	e.line("static inline bool " + P + "_un_ne(" + P + " a, " + P + " b) { return " + P + "_ne(a, b); }");
+	e.line("");
+
+	// ---- vector types ----
+	e.line("// ---- Vector types ----");
+	for (uint32_t n = 2; n <= 4; n++)
+	{
+		std::string V = e.vec(n);
+		std::string members;
+		for (uint32_t i = 0; i < n; i++)
+			members += (i ? ", " : "") + std::string(comp_name(i));
+
+		e.line("struct " + V + " {");
+		e.line("    " + P + " " + members + ";");
+		// A dynamic index into a vector has to resolve to a member.
+		std::string chain = "z";
+		if (n == 2)
+			chain = "y";
+		else if (n == 4)
+			chain = "(i == 2 ? z : w)";
+		std::string body = n == 2 ? "return i == 0 ? x : y;" :
+		                            "return i == 0 ? x : (i == 1 ? y : " + chain + ");";
+		e.line("    thread " + P + " &operator[](int i) { " + body + " }");
+		e.line("    const thread " + P + " &operator[](int i) const { " + body + " }");
+		e.line("};");
+	}
+	e.line("");
+
+	// ---- component-wise vector operations ----
+	struct Unary { const char *name; };
+	static const Unary unaries[] = { { "neg" },   { "abs" },       { "sqrt" },  { "floor" }, { "ceil" },
+		                             { "trunc" }, { "round" },     { "roundeven" }, { "sign" },
+		                             { "fract" }, { "inversesqrt" } };
+	static const char *binaries[] = { "add", "sub", "mul", "div", "min", "max", "mod", "rem" };
+	static const char *compares[] = { "eq",    "ne",    "lt",    "le",    "gt",    "ge",
+		                              "un_eq", "un_ne", "un_lt", "un_le", "un_gt", "un_ge" };
+	static const char *converts[] = { "float", "int", "uint" };
+
+	e.line("// ---- Vector operations ----");
+	for (uint32_t n = 2; n <= 4; n++)
+	{
+		const std::string V = e.vec(n);
+		const std::string B = "bool" + std::to_string(n);
+
+		for (auto &u : unaries)
+		{
+			std::vector<std::string> parts;
+			for (uint32_t i = 0; i < n; i++)
+				parts.push_back(e.call(u.name, e.at("a", i, n)));
+			e.line("static inline " + V + " " + P + "_" + u.name + "(" + V + " a) { return " + e.build(n, parts) +
+			       "; }");
+		}
+
+		for (auto *b : binaries)
+		{
+			std::vector<std::string> vv, vs, sv;
+			for (uint32_t i = 0; i < n; i++)
+			{
+				vv.push_back(e.call(b, e.at("a", i, n), e.at("b", i, n)));
+				vs.push_back(e.call(b, e.at("a", i, n), "b"));
+				sv.push_back(e.call(b, "a", e.at("b", i, n)));
+			}
+			e.line("static inline " + V + " " + P + "_" + b + "(" + V + " a, " + V + " b) { return " +
+			       e.build(n, vv) + "; }");
+			e.line("static inline " + V + " " + P + "_" + b + "(" + V + " a, " + P + " b) { return " +
+			       e.build(n, vs) + "; }");
+			e.line("static inline " + V + " " + P + "_" + b + "(" + P + " a, " + V + " b) { return " +
+			       e.build(n, sv) + "; }");
+		}
+
+		for (auto *c : compares)
+		{
+			std::string s = "static inline " + B + " " + P + "_" + c + "(" + V + " a, " + V + " b) { return " + B +
+			                "(";
+			for (uint32_t i = 0; i < n; i++)
+				s += (i ? ", " : "") + e.call(c, e.at("a", i, n), e.at("b", i, n));
+			e.line(s + "); }");
+		}
+
+		for (auto *c : converts)
+		{
+			std::string native = std::string(c) + std::to_string(n);
+			std::vector<std::string> from;
+			std::string to = native + "(";
+			for (uint32_t i = 0; i < n; i++)
+			{
+				from.push_back(e.call(std::string("from_") + c, e.at("a", i, n)));
+				to += (i ? ", " : "") + e.call(std::string("to_") + c, e.at("a", i, n));
+			}
+			e.line("static inline " + V + " " + P + "_from_" + c + "(" + native + " a) { return " +
+			       e.build(n, from) + "; }");
+			e.line("static inline " + native + " " + P + "_to_" + c + "(" + V + " a) { return " + to + "); }");
+		}
+
+		// three-operand builtins, with the scalar-tail forms GLSL also allows
+		static const char *ternaries[] = { "clamp", "mix", "smoothstep", "fma" };
+		for (auto *t : ternaries)
+		{
+			std::vector<std::string> vvv, vvs;
+			for (uint32_t i = 0; i < n; i++)
+			{
+				vvv.push_back(e.call(t, e.at("a", i, n), e.at("b", i, n), e.at("c", i, n)));
+				vvs.push_back(e.call(t, e.at("a", i, n), "b", "c"));
+			}
+			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + V + " c) { return " +
+			       e.build(n, vvv) + "; }");
+			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + P + " b, " + P + " c) { return " +
+			       e.build(n, vvs) + "; }");
+			// mix and smoothstep also take a scalar only in the last operand
+			std::vector<std::string> vvt;
+			for (uint32_t i = 0; i < n; i++)
+				vvt.push_back(e.call(t, e.at("a", i, n), e.at("b", i, n), "c"));
+			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + P + " c) { return " +
+			       e.build(n, vvt) + "; }");
+		}
+
+		// step takes its edge first, so the scalar form is the other way round
+		{
+			std::vector<std::string> vv, sv;
+			for (uint32_t i = 0; i < n; i++)
+			{
+				vv.push_back(e.call("step", e.at("edge", i, n), e.at("a", i, n)));
+				sv.push_back(e.call("step", "edge", e.at("a", i, n)));
+			}
+			e.line("static inline " + V + " " + P + "_step(" + V + " edge, " + V + " a) { return " +
+			       e.build(n, vv) + "; }");
+			e.line("static inline " + V + " " + P + "_step(" + P + " edge, " + V + " a) { return " +
+			       e.build(n, sv) + "; }");
+		}
+
+		// select on a boolean vector, which is how GLSL's mix(a, b, bvec) arrives
+		{
+			std::string s = "static inline " + V + " " + P + "_select(" + V + " a, " + V + " b, " + B +
+			                " t) { return " + V + "{";
+			for (uint32_t i = 0; i < n; i++)
+				s += std::string(i ? ", " : "") + "(t." + comp_name(i) + " ? b." + comp_name(i) + " : a." +
+				     comp_name(i) + ")";
+			e.line(s + "}; }");
+		}
+
+		// isnan / isinf answer per component
+		for (const char *q : { "isnan", "isinf" })
+		{
+			std::string s = "static inline " + B + " " + P + "_" + q + "(" + V + " a) { return " + B + "(";
+			for (uint32_t i = 0; i < n; i++)
+				s += (i ? ", " : "") + e.call(q, e.at("a", i, n));
+			e.line(s + "); }");
+		}
+
+		// ldexp, frexp and modf carry a second, non-double operand
+		{
+			std::vector<std::string> parts;
+			for (uint32_t i = 0; i < n; i++)
+				parts.push_back(e.call("ldexp", e.at("a", i, n), "n." + std::string(comp_name(i))));
+			e.line("static inline " + V + " " + P + "_ldexp(" + V + " a, int" + std::to_string(n) +
+			       " n) { return " + e.build(n, parts) + "; }");
+
+			std::string s = "static inline " + V + " " + P + "_frexp(" + V + " a, thread int" +
+			                std::to_string(n) + " &n) { " + V + " r;";
+			for (uint32_t i = 0; i < n; i++)
+			{
+				std::string c = comp_name(i);
+				s += " int e" + std::to_string(i) + "; r." + c + " = " + P + "_frexp(a." + c + ", e" +
+				     std::to_string(i) + "); n." + c + " = e" + std::to_string(i) + ";";
+			}
+			e.line(s + " return r; }");
+
+			s = "static inline " + V + " " + P + "_modf(" + V + " a, thread " + V + " &ip) { return " + V + "{";
+			for (uint32_t i = 0; i < n; i++)
+			{
+				std::string c = comp_name(i);
+				s += std::string(i ? ", " : "") + P + "_modf(a." + c + ", ip." + c + ")";
+			}
+			e.line(s + "}; }");
+		}
+
+		// geometric functions
+		{
+			std::string dot;
+			for (uint32_t i = 0; i < n; i++)
+			{
+				std::string term = e.mul(e.at("a", i, n), e.at("b", i, n));
+				dot = i ? e.add(dot, term) : term;
+			}
+			e.line("static inline " + P + " " + P + "_dot" + std::to_string(n) + "(" + V + " a, " + V +
+			       " b) { return " + dot + "; }");
+			e.line("static inline " + P + " " + P + "_length" + std::to_string(n) + "(" + V + " a) { return " +
+			       e.call("sqrt", P + "_dot" + std::to_string(n) + "(a, a)") + "; }");
+			e.line("static inline " + P + " " + P + "_distance" + std::to_string(n) + "(" + V + " a, " + V +
+			       " b) { return " + P + "_length" + std::to_string(n) + "(" + P + "_sub(a, b)); }");
+			e.line("static inline " + V + " " + P + "_normalize" + std::to_string(n) + "(" + V +
+			       " a) { return " + P + "_mul(a, " + e.div(e.lit(1.0f), P + "_length" + std::to_string(n) + "(a)") +
+			       "); }");
+			// reflect: a - 2 * dot(nrm, a) * nrm
+			e.line("static inline " + V + " " + P + "_reflect" + std::to_string(n) + "(" + V + " a, " + V +
+			       " nrm) { return " + P + "_sub(a, " + P + "_mul(nrm, " +
+			       e.mul(e.lit(2.0f), P + "_dot" + std::to_string(n) + "(nrm, a)") + ")); }");
+			// faceforward: dot(ref, i) < 0 ? n : -n
+			e.line("static inline " + V + " " + P + "_faceforward" + std::to_string(n) + "(" + V + " nrm, " + V +
+			       " i, " + V + " ref) { return " + P + "_lt(" + P + "_dot" + std::to_string(n) +
+			       "(ref, i), " + e.lit(0.0f) + ") ? nrm : " + P + "_neg(nrm); }");
+			e.line("static inline " + V + " " + P + "_refract" + std::to_string(n) + "(" + V + " i, " + V +
+			       " nrm, " + P + " eta) {");
+			e.line("    " + P + " d = " + P + "_dot" + std::to_string(n) + "(nrm, i);");
+			e.line("    " + P + " k = " + e.sub(e.lit(1.0f), e.mul(e.mul("eta", "eta"),
+			                                                       e.sub(e.lit(1.0f), e.mul("d", "d")))) + ";");
+			e.line("    if (" + P + "_lt(k, " + e.lit(0.0f) + ")) return " + V + "{" +
+			       [&] { std::string s; for (uint32_t i = 0; i < n; i++) s += (i ? ", " : "") + e.lit(0.0f); return s; }() +
+			       "};");
+			e.line("    return " + P + "_sub(" + P + "_mul(i, eta), " + P + "_mul(nrm, " +
+			       e.add(e.mul("eta", "d"), e.call("sqrt", "k")) + ")); }");
+		}
+		if (n == 3)
+		{
+			std::vector<std::string> parts;
+			static const uint32_t a1[3] = { 1, 2, 0 }, a2[3] = { 2, 0, 1 };
+			for (uint32_t i = 0; i < 3; i++)
+				parts.push_back(e.sub(e.mul("a." + std::string(comp_name(a1[i])), "b." + std::string(comp_name(a2[i]))),
+				                      e.mul("a." + std::string(comp_name(a2[i])), "b." + std::string(comp_name(a1[i])))));
+			e.line("static inline " + V + " " + P + "_cross(" + V + " a, " + V + " b) { return " + e.build(3, parts) +
+			       "; }");
+		}
+		e.line("");
+	}
+
+	if (!want_matrices)
+		return e.out;
+
+	// ---- matrix types ----
+	e.line("// ---- Matrix types: c0..cN are columns, as in GLSL ----");
+	for (uint32_t cols = 2; cols <= 4; cols++)
+	{
+		for (uint32_t rows = 2; rows <= 4; rows++)
+		{
+			std::string M = e.mat(cols, rows), V = e.vec(rows);
+			e.line("struct " + M + " {");
+			std::string members;
+			for (uint32_t i = 0; i < cols; i++)
+				members += (i ? ", " : "") + ("c" + std::to_string(i));
+			e.line("    " + V + " " + members + ";");
+			std::string body;
+			if (cols == 2)
+				body = "return i == 0 ? c0 : c1;";
+			else if (cols == 3)
+				body = "return i == 0 ? c0 : (i == 1 ? c1 : c2);";
+			else
+				body = "return i == 0 ? c0 : (i == 1 ? c1 : (i == 2 ? c2 : c3));";
+			e.line("    thread " + V + " &operator[](int i) { " + body + " }");
+			e.line("    const thread " + V + " &operator[](int i) const { " + body + " }");
+			e.line("};");
+		}
+	}
+	e.line("");
+
+	e.line("// ---- Matrix operations ----");
+	for (uint32_t cols = 2; cols <= 4; cols++)
+	{
+		for (uint32_t rows = 2; rows <= 4; rows++)
+		{
+			const std::string M = e.mat(cols, rows), VR = e.vec(rows), VC = e.vec(cols);
+
+			// Component-wise. The linear-algebra product is _mul, below, so the
+			// component-wise multiply has to answer to a different name.
+			for (const char *b : { "add", "sub", "div", "compmult" })
+			{
+				const char *op = strcmp(b, "compmult") == 0 ? "mul" : b;
+				std::vector<std::string> parts;
+				for (uint32_t i = 0; i < cols; i++)
+					parts.push_back(e.call(op, e.col("a", i), e.col("b", i)));
+				e.line("static inline " + M + " " + P + "_" + b + "(" + M + " a, " + M + " b) { return " +
+				       e.buildMat(cols, rows, parts) + "; }");
+			}
+			{
+				std::vector<std::string> parts;
+				for (uint32_t i = 0; i < cols; i++)
+					parts.push_back(e.call("neg", e.col("a", i)));
+				e.line("static inline " + M + " " + P + "_neg(" + M + " a) { return " +
+				       e.buildMat(cols, rows, parts) + "; }");
+			}
+			{
+				std::vector<std::string> ms, sm;
+				for (uint32_t i = 0; i < cols; i++)
+				{
+					ms.push_back(e.call("mul", e.col("a", i), "b"));
+					sm.push_back(e.call("mul", "a", e.col("b", i)));
+				}
+				e.line("static inline " + M + " " + P + "_mul(" + M + " a, " + P + " b) { return " +
+				       e.buildMat(cols, rows, ms) + "; }");
+				e.line("static inline " + M + " " + P + "_mul(" + P + " a, " + M + " b) { return " +
+				       e.buildMat(cols, rows, sm) + "; }");
+			}
+			// matrix * vector: sum of columns scaled by the vector's components
+			{
+				std::vector<std::string> parts;
+				for (uint32_t r = 0; r < rows; r++)
+				{
+					std::string sum;
+					for (uint32_t c = 0; c < cols; c++)
+					{
+						std::string term = e.mul(e.col("a", c) + "." + comp_name(r), "b." + std::string(comp_name(c)));
+						sum = c ? e.add(sum, term) : term;
+					}
+					parts.push_back(sum);
+				}
+				e.line("static inline " + VR + " " + P + "_mul(" + M + " a, " + VC + " b) { return " +
+				       e.build(rows, parts) + "; }");
+			}
+			// vector * matrix: each result component is a dot with one column
+			{
+				std::vector<std::string> parts;
+				for (uint32_t c = 0; c < cols; c++)
+				{
+					std::string sum;
+					for (uint32_t r = 0; r < rows; r++)
+					{
+						std::string term = e.mul("a." + std::string(comp_name(r)), e.col("b", c) + "." + comp_name(r));
+						sum = r ? e.add(sum, term) : term;
+					}
+					parts.push_back(sum);
+				}
+				e.line("static inline " + VC + " " + P + "_mul(" + VR + " a, " + M + " b) { return " +
+				       e.build(cols, parts) + "; }");
+			}
+			// transpose
+			{
+				std::vector<std::string> parts;
+				for (uint32_t r = 0; r < rows; r++)
+				{
+					std::vector<std::string> comps;
+					for (uint32_t c = 0; c < cols; c++)
+						comps.push_back(e.col("a", c) + "." + comp_name(r));
+					parts.push_back(e.build(cols, comps));
+				}
+				e.line("static inline " + e.mat(rows, cols) + " " + P + "_transpose(" + M + " a) { return " +
+				       e.buildMat(rows, cols, parts) + "; }");
+			}
+			// outer product of a rows-vector and a cols-vector makes this shape
+			{
+				std::vector<std::string> parts;
+				for (uint32_t c = 0; c < cols; c++)
+				{
+					std::vector<std::string> comps;
+					for (uint32_t r = 0; r < rows; r++)
+						comps.push_back(e.mul("a." + std::string(comp_name(r)), "b." + std::string(comp_name(c))));
+					parts.push_back(e.build(rows, comps));
+				}
+				e.line("static inline " + M + " " + P + "_outer(" + VR + " a, " + VC + " b) { return " +
+				       e.buildMat(cols, rows, parts) + "; }");
+			}
+		}
+	}
+
+	// matrix * matrix, for every pair whose inner sizes agree
+	for (uint32_t cols = 2; cols <= 4; cols++)
+		for (uint32_t rows = 2; rows <= 4; rows++)
+			for (uint32_t bcols = 2; bcols <= 4; bcols++)
+			{
+				// a is cols x rows, b is bcols x cols, result is bcols x rows
+				std::vector<std::string> parts;
+				for (uint32_t c = 0; c < bcols; c++)
+				{
+					std::vector<std::string> comps;
+					for (uint32_t r = 0; r < rows; r++)
+					{
+						std::string sum;
+						for (uint32_t k = 0; k < cols; k++)
+						{
+							std::string term = e.mul(e.col("a", k) + "." + comp_name(r),
+							                         e.col("b", c) + "." + comp_name(k));
+							sum = k ? e.add(sum, term) : term;
+						}
+						comps.push_back(sum);
+					}
+					parts.push_back(e.build(rows, comps));
+				}
+				e.line("static inline " + e.mat(bcols, rows) + " " + P + "_mul(" + e.mat(cols, rows) + " a, " +
+				       e.mat(bcols, cols) + " b) { return " + e.buildMat(bcols, rows, parts) + "; }");
+			}
+
+	// determinant and inverse, square only
+	for (uint32_t n = 2; n <= 4; n++)
+	{
+		const std::string M = e.mat(n, n);
+		auto el = [&](const std::string &m, uint32_t c, uint32_t r) {
+			return e.col(m, c) + "." + comp_name(r);
+		};
+		// minor determinant of the submatrix that drops the listed rows/columns
+		std::function<std::string(const std::vector<uint32_t> &, const std::vector<uint32_t> &)> det =
+		    [&](const std::vector<uint32_t> &cs, const std::vector<uint32_t> &rs) -> std::string {
+			if (cs.size() == 1)
+				return el("a", cs[0], rs[0]);
+			std::string sum;
+			for (size_t i = 0; i < cs.size(); i++)
+			{
+				std::vector<uint32_t> sub_c, sub_r(rs.begin() + 1, rs.end());
+				for (size_t j = 0; j < cs.size(); j++)
+					if (j != i)
+						sub_c.push_back(cs[j]);
+				std::string term = e.mul(el("a", cs[i], rs[0]), det(sub_c, sub_r));
+				if (i == 0)
+					sum = term;
+				else
+					sum = (i % 2) ? e.sub(sum, term) : e.add(sum, term);
+			}
+			return sum;
+		};
+		std::vector<uint32_t> all;
+		for (uint32_t i = 0; i < n; i++)
+			all.push_back(i);
+		e.line("static inline " + P + " " + P + "_determinant(" + M + " a) { return " + det(all, all) + "; }");
+
+		// inverse from the adjugate; the cofactor of (c,r) lands at (r,c)
+		std::vector<std::string> parts;
+		for (uint32_t c = 0; c < n; c++)
+		{
+			std::vector<std::string> comps;
+			for (uint32_t r = 0; r < n; r++)
+			{
+				// transposed: entry (c,r) of the inverse is cofactor (r,c)
+				std::vector<uint32_t> sub_c, sub_r;
+				for (uint32_t i = 0; i < n; i++)
+				{
+					if (i != r)
+						sub_c.push_back(i);
+					if (i != c)
+						sub_r.push_back(i);
+				}
+				std::string cof = det(sub_c, sub_r);
+				if ((r + c) % 2)
+					cof = e.neg(cof);
+				comps.push_back(e.mul(cof, "inv_det"));
+			}
+			parts.push_back(e.build(n, comps));
+		}
+		e.line("static inline " + M + " " + P + "_inverse(" + M + " a) {");
+		e.line("    " + P + " inv_det = " + e.div(e.lit(1.0f), P + "_determinant(a)") + ";");
+		e.line("    return " + e.buildMat(n, n, parts) + "; }");
+	}
+	e.line("");
+
+	return e.out;
+}
 
 // ---------------------------------------------------------------------------
 // Public API

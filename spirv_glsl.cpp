@@ -6556,7 +6556,10 @@ string CompilerGLSL::constant_expression(const SPIRConstant &c,
 	}
 	else
 	{
-		string res = type_to_glsl(type) + "(";
+		// A type the backend builds out of structs takes a brace initialiser,
+		// not a constructor call.
+		bool braces = composite_constant_needs_braces(type);
+		string res = type_to_glsl(type) + (braces ? "{" : "(");
 		for (uint32_t col = 0; col < c.columns(); col++)
 		{
 			if (c.specialization_constant_id(col) != 0)
@@ -6567,7 +6570,7 @@ string CompilerGLSL::constant_expression(const SPIRConstant &c,
 			if (col + 1 < c.columns())
 				res += ", ";
 		}
-		res += ")";
+		res += braces ? "}" : ")";
 
 		if (inside_struct_scope &&
 		    backend.boolean_in_struct_remapped_type != SPIRType::Boolean &&
@@ -11517,7 +11520,10 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 			row_major_matrix_needs_conversion = false;
 
 			is_packed = false;
-			physical_type = 0;
+			// A component of an emulated double is still a stored value that
+			// has to be decoded, so it keeps the storage type its member had.
+			if (!keep_physical_type_for_scalar_access(*type))
+				physical_type = 0;
 			type_id = type->parent_type;
 			type = &get<SPIRType>(type_id);
 		}
@@ -11553,6 +11559,16 @@ bool CompilerGLSL::check_physical_type_cast(std::string &, const SPIRType *, uin
 }
 
 bool CompilerGLSL::prepare_access_chain_for_scalar_access(std::string &, const SPIRType &, StorageClass, bool &)
+{
+	return false;
+}
+
+bool CompilerGLSL::keep_physical_type_for_scalar_access(const SPIRType &) const
+{
+	return false;
+}
+
+bool CompilerGLSL::composite_constant_needs_braces(const SPIRType &) const
 {
 	return false;
 }

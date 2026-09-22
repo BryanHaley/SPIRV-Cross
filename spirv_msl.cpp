@@ -1829,6 +1829,7 @@ string CompilerMSL::compile()
 	// Mark any non-stage-in structs to be tightly packed.
 	mark_packable_structs();
 	mark_fp64_struct_members();
+	declare_fp64_plain_uniforms();
 	reorder_type_alias();
 
 	// Add fixup hooks required by shader inputs and outputs. This needs to happen before
@@ -2552,11 +2553,14 @@ void CompilerMSL::mark_fp64_struct_members()
 			if (mbr_type.basetype != SPIRType::Double)
 				continue;
 
-			// dvec and dmat already refuse earlier; this is the scalar case
-			if (mbr_type.vecsize > 1 || mbr_type.columns > 1)
+			if (has_extended_member_decoration(struct_id, i, SPIRVCrossDecorationPhysicalTypeID))
 				continue;
 
-			if (has_extended_member_decoration(struct_id, i, SPIRVCrossDecorationPhysicalTypeID))
+			// Only a block laid out in memory keeps its doubles as binary64
+			// bits. A struct that is only ever a value -- including the ones
+			// this compiler makes for itself -- holds the float form directly,
+			// and has no offsets.
+			if (!has_member_decoration(struct_id, i, DecorationOffset))
 				continue;
 
 			auto storage_type = mbr_type;
@@ -2565,6 +2569,25 @@ void CompilerMSL::mark_fp64_struct_members()
 			storage_type.vecsize = 2;
 			storage_type.columns = 1;
 			storage_type.parent_type = 0;
+
+			// A vector is that many binary64 slots in a row. A matrix is an
+			// array of columns, each as long as the block's stride says, so
+			// the padding a dvec3 column carries is part of the column.
+			if (mbr_type.columns > 1)
+			{
+				uint32_t stride = has_member_decoration(struct_id, i, DecorationMatrixStride) ?
+				                      get_member_decoration(struct_id, i, DecorationMatrixStride) :
+				                      mbr_type.vecsize * 8;
+				storage_type.array.push_back(stride / 8);
+				storage_type.array_size_literal.push_back(true);
+				storage_type.array.push_back(mbr_type.columns);
+				storage_type.array_size_literal.push_back(true);
+			}
+			else if (mbr_type.vecsize > 1)
+			{
+				storage_type.array.push_back(mbr_type.vecsize);
+				storage_type.array_size_literal.push_back(true);
+			}
 
 			uint32_t type_id = ir.increase_bound_by(1);
 			set<SPIRType>(type_id, storage_type);
@@ -3055,6 +3078,101 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 	}
 
 	set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
+}
+
+// A double varying crosses the stage boundary as one uint2 of binary64 bits per
+// component, at its own location. The shader keeps working on the float form in
+// a local, and these members are filled from it on the way out and read back
+// into it on the way in.
+void CompilerMSL::add_fp64_variable_to_interface_block(StorageClass storage, const string &ib_var_ref,
+                                                       SPIRType &ib_type, SPIRVariable &var,
+                                                       InterfaceBlockMeta &meta)
+{
+	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
+	auto &var_type = meta.strip_array ? get_variable_element_type(var) : get_variable_data_type(var);
+
+	uint32_t rows = var_type.vecsize;
+	uint32_t cols = var_type.columns;
+	uint32_t slots = rows * cols;
+
+	// uint2 is the type every slot takes.
+	SPIRType slot_type = var_type;
+	slot_type.basetype = SPIRType::UInt;
+	slot_type.width = 32;
+	slot_type.vecsize = 2;
+	slot_type.columns = 1;
+	slot_type.array.clear();
+	slot_type.array_size_literal.clear();
+	slot_type.parent_type = 0;
+	uint32_t slot_type_id = ir.increase_bound_by(1);
+	set<SPIRType>(slot_type_id, slot_type);
+
+	bool is_flat = has_decoration(var.self, DecorationFlat);
+	bool is_noperspective = has_decoration(var.self, DecorationNoPerspective);
+	bool is_centroid = has_decoration(var.self, DecorationCentroid);
+	bool is_sample = has_decoration(var.self, DecorationSample);
+	bool has_location = get_decoration_bitset(var.self).get(DecorationLocation);
+
+	static const char *comps[] = { "x", "y", "z", "w" };
+	const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
+	const char *encode = get_fp64_encode_name(msl_options.fp64_mode);
+
+	// The shader keeps using the variable by name, so it needs to exist as a
+	// local of the original type; the members above are only its wire form.
+	if (!meta.strip_array)
+	{
+		entry_func.add_local_variable(var.self);
+		vars_needing_early_declaration.push_back(var.self);
+	}
+
+	for (uint32_t i = 0; i < slots; i++)
+	{
+		uint32_t ib_mbr_idx = uint32_t(ib_type.member_types.size());
+		ib_type.member_types.push_back(slot_type_id);
+
+		string mbr_name = ensure_valid_name(join(to_expression(var.self), "_", i), "m");
+		set_member_name(ib_type.self, ib_mbr_idx, mbr_name);
+
+		if (has_location)
+		{
+			uint32_t locn = get_decoration(var.self, DecorationLocation) + i;
+			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationLocation, locn);
+			mark_location_as_used_by_shader(locn, slot_type, storage);
+		}
+
+		// Bits carry no gradient, so they are always flat.
+		set_member_decoration(ib_type.self, ib_mbr_idx, DecorationFlat);
+		if (is_noperspective)
+			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationNoPerspective);
+		if (is_centroid)
+			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationCentroid);
+		if (is_sample)
+			set_member_decoration(ib_type.self, ib_mbr_idx, DecorationSample);
+
+		set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
+
+		if (meta.strip_array)
+			continue;
+
+		// Which component of the value this slot holds.
+		string local = cols > 1 ? join(".c", i / rows, ".", comps[i % rows]) :
+		               rows > 1 ? join(".", comps[i]) : string();
+
+		if (storage == StorageClassInput)
+		{
+			entry_func.fixup_hooks_in.push_back([=, &var]() {
+				statement(to_name(var.self), local, " = ", decode, "(", ib_var_ref, ".", mbr_name, ");");
+			});
+		}
+		else if (storage == StorageClassOutput)
+		{
+			entry_func.fixup_hooks_out.push_back([=, &var]() {
+				statement(ib_var_ref, ".", mbr_name, " = ", encode, "(", to_name(var.self), local, ");");
+			});
+		}
+	}
+
+	(void)is_flat;
 }
 
 void CompilerMSL::add_composite_variable_to_interface_block(StorageClass storage, const string &ib_var_ref,
@@ -4149,8 +4267,15 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			if (builtin == BuiltInClipDistance || builtin == BuiltInCullDistance)
 				is_builtin = false;
 
+			// An emulated double is a struct, and Metal takes no struct across
+			// stages, so a double varying travels as its binary64 bits.
+			if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && storage_is_stage_io &&
+			    var_type.basetype == SPIRType::Double && !is_array(var_type))
+			{
+				add_fp64_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
+			}
 			// MSL does not allow matrices or arrays in input or output variables, so need to handle it specially.
-			if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
+			else if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
 			{
 				add_composite_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
 			}
@@ -5217,6 +5342,12 @@ bool CompilerMSL::validate_member_packing_rules_msl(const SPIRType &type, uint32
 	auto &mbr_type = get<SPIRType>(type.member_types[index]);
 	uint32_t spirv_offset = get_member_decoration(type.self, index, DecorationOffset);
 
+	// A double already carries a storage type of its own: the binary64 slots it
+	// is kept in, laid out to the block's own offsets. Nothing further to remap.
+	if (msl_options.fp64_mode != FP64Mode::Disabled && mbr_type.basetype == SPIRType::Double &&
+	    has_extended_member_decoration(type.self, index, SPIRVCrossDecorationPhysicalTypeID))
+		return true;
+
 	if (index + 1 < type.member_types.size())
 	{
 		// First, we will check offsets. If SPIR-V offset + MSL size > SPIR-V offset of next member,
@@ -5466,6 +5597,165 @@ void CompilerMSL::ensure_member_packing_rules_msl(SPIRType &ib_type, uint32_t in
 // A double that reaches a stage interface is declared as its raw binary64 bits,
 // because Metal will not carry a struct between stages. The emulation works on
 // MGLtf, so a store or load across that boundary has to encode or decode.
+// Reads a double, a dvec or a dmat back out of the binary64 slots it is stored
+// in. A vector is one slot per component; a matrix is one run per column, and
+// the run may be longer than the column when the block pads it.
+std::string CompilerMSL::fp64_decode_expression(const SPIRType &type, const SPIRType &physical_type,
+                                                const std::string &expr_str)
+{
+	const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
+
+	if (type.vecsize == 1 && type.columns == 1)
+		return join(decode, "(", expr_str, ")");
+
+	(void)physical_type;
+
+	std::string result = type_to_glsl(type) + "{";
+	for (uint32_t c = 0; c < type.columns; c++)
+	{
+		if (c)
+			result += ", ";
+		if (type.columns > 1)
+			result += type_to_glsl(get_fp64_column_type(type)) + "{";
+		for (uint32_t r = 0; r < type.vecsize; r++)
+		{
+			std::string slot = type.columns > 1 ? join("[", c, "][", r, "]") : join("[", r, "]");
+			result += join(r ? ", " : "", decode, "(", enclose_expression(expr_str), slot, ")");
+		}
+		if (type.columns > 1)
+			result += "}";
+	}
+	return result + "}";
+}
+
+// A double declared straight in the default uniform block, rather than inside a
+// block of its own. It has no member offsets, so its slots pack tightly.
+bool CompilerMSL::is_fp64_plain_uniform(uint32_t var_id) const
+{
+	if (msl_options.fp64_mode == FP64Mode::Disabled)
+		return false;
+
+	auto *var = maybe_get<SPIRVariable>(var_id);
+	if (!var)
+		return false;
+
+	if (var->storage != StorageClassUniform && var->storage != StorageClassUniformConstant &&
+	    var->storage != StorageClassPushConstant)
+		return false;
+
+	auto &type = get_variable_data_type(*var);
+	return type.basetype == SPIRType::Double && type.array.empty();
+}
+
+// Rebuilds the value from the slots a plain uniform points at, which are packed
+// with nothing between them.
+// Named from the id, because declaring the value as a local may rename the
+// variable afterwards and the argument has to keep answering to one name.
+std::string CompilerMSL::fp64_plain_uniform_slots_name(uint32_t var_id)
+{
+	return join("mglSlots_", var_id);
+}
+
+// Reads the whole value out of the slots once, at the top of the entry point.
+// Everything after that works on an ordinary local of the real type, so a
+// component read or a swizzle needs nothing special.
+void CompilerMSL::declare_fp64_plain_uniforms()
+{
+	if (msl_options.fp64_mode == FP64Mode::Disabled)
+		return;
+
+	auto &entry_func = get<SPIRFunction>(ir.default_entry_point);
+	SmallVector<uint32_t> ids;
+
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &) {
+		if (is_fp64_plain_uniform(var_id))
+			ids.push_back(var_id);
+	});
+
+	for (uint32_t var_id : ids)
+	{
+		entry_func.add_local_variable(var_id);
+		vars_needing_early_declaration.push_back(var_id);
+		entry_func.fixup_hooks_in.push_back([this, var_id]() {
+			// A uniform the shader never reads is pruned before it becomes an
+			// argument, and then there are no slots to read it from.
+			if (fp64_plain_uniforms_with_args.count(var_id))
+				statement(to_name(var_id), " = ", fp64_plain_uniform_expression(var_id), ";");
+		});
+	}
+}
+
+std::string CompilerMSL::fp64_plain_uniform_expression(uint32_t var_id)
+{
+	auto &type = get_variable_data_type(get<SPIRVariable>(var_id));
+	const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
+	std::string name = fp64_plain_uniform_slots_name(var_id);
+
+	if (type.vecsize == 1 && type.columns == 1)
+		return join(decode, "(", name, "[0])");
+
+	std::string result = type_to_glsl(type) + "{";
+	for (uint32_t c = 0; c < type.columns; c++)
+	{
+		if (c)
+			result += ", ";
+		if (type.columns > 1)
+			result += type_to_glsl(get_fp64_column_type(type)) + "{";
+		for (uint32_t r = 0; r < type.vecsize; r++)
+			result += join(r ? ", " : "", decode, "(", name, "[", c * type.vecsize + r, "])");
+		if (type.columns > 1)
+			result += "}";
+	}
+	return result + "}";
+}
+
+// One component of an emulated vector. The value may still be sitting in its
+// binary64 slots, so it has to be decoded before a component can be named.
+std::string CompilerMSL::fp64_component_expression(uint32_t id, uint32_t index)
+{
+	return join(enclose_expression(to_unpacked_expression(id)), ".", index_to_swizzle(index));
+}
+
+// The type of one column of a matrix, which is the vector the prelude declares.
+SPIRType CompilerMSL::get_fp64_column_type(const SPIRType &type) const
+{
+	SPIRType column = type;
+	column.columns = 1;
+	column.array.clear();
+	column.array_size_literal.clear();
+	return column;
+}
+
+// Writes a double, a dvec or a dmat back into its binary64 slots.
+void CompilerMSL::fp64_emit_encode_store(const std::string &lhs, const SPIRType &type,
+                                         const SPIRType *physical_type, const std::string &rhs)
+{
+	const char *encode = get_fp64_encode_name(msl_options.fp64_mode);
+
+	if (type.vecsize == 1 && type.columns == 1)
+	{
+		statement(lhs, " = ", encode, "(", rhs, ");");
+		return;
+	}
+
+	(void)physical_type;
+
+	// The value is written more than once, so evaluate it once first.
+	std::string tmp = join("_", ir.increase_bound_by(1), "_fp64_store");
+	statement(type_to_glsl(type), " ", tmp, " = ", rhs, ";");
+
+	static const char *comps[] = { "x", "y", "z", "w" };
+	for (uint32_t c = 0; c < type.columns; c++)
+	{
+		for (uint32_t r = 0; r < type.vecsize; r++)
+		{
+			std::string slot = type.columns > 1 ? join("[", c, "][", r, "]") : join("[", r, "]");
+			std::string value = type.columns > 1 ? join(tmp, ".c", c, ".", comps[r]) : join(tmp, ".", comps[r]);
+			statement(enclose_expression(lhs), slot, " = ", encode, "(", value, ");");
+		}
+	}
+}
+
 uint32_t CompilerMSL::fp64_interface_storage_type(uint32_t var_id) const
 {
 	if (msl_options.fp64_mode == FP64Mode::Disabled)
@@ -5524,8 +5814,14 @@ void CompilerMSL::emit_store_statement(uint32_t lhs_expression, uint32_t rhs_exp
 	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double &&
 	    (lhs_remapped_type || fp64_interface_storage_type(lhs_expression) != 0))
 	{
-		statement(to_expression(lhs_expression), " = ", get_fp64_encode_name(msl_options.fp64_mode), "(",
-		          to_unpacked_expression(rhs_expression), ");");
+		const SPIRType *physical = nullptr;
+		if (lhs_remapped_type)
+			physical = &get<SPIRType>(get_extended_decoration(lhs_expression, SPIRVCrossDecorationPhysicalTypeID));
+		else
+			physical = &get<SPIRType>(fp64_interface_storage_type(lhs_expression));
+
+		fp64_emit_encode_store(to_expression(lhs_expression), type, physical,
+		                       to_unpacked_expression(rhs_expression));
 		register_write(lhs_expression);
 		return;
 	}
@@ -5806,7 +6102,7 @@ string CompilerMSL::unpack_expression_type(string expr_str, const SPIRType &type
 	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double &&
 	    physical_type && physical_type->basetype == SPIRType::UInt && physical_type->vecsize == 2)
 	{
-		return join(get_fp64_decode_name(msl_options.fp64_mode), "(", expr_str, ")");
+		return fp64_decode_expression(type, *physical_type, expr_str);
 	}
 
 	static const char *swizzle_lut[] = {
@@ -6157,26 +6453,38 @@ std::string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint3
 	auto &type = get<SPIRType>(c.constant_type);
 	if (type.basetype == SPIRType::Double && msl_options.fp64_mode != FP64Mode::Disabled)
 	{
-		// Split the double value into float components
-		float x, y, z;
-		double value = c.scalar_f64(vector, 0);
-		if (msl_options.fp64_mode == FP64Mode::TripleFloat)
-		{
-			split_double_tf(value, x, y, z);
-			// Format with enough precision
+		// Each component is its own struct of floats, and a vector of them is a
+		// struct again. Writing only the first component left a dvec3 declared
+		// as a scalar.
+		auto scalar = [&](uint32_t row) {
+			double value = c.scalar_f64(vector, row);
 			char buf[256];
-			snprintf(buf, sizeof(buf), "%s{%.9e, %.9e, %.9e}",
-			         get_fp64_type_name(msl_options.fp64_mode), x, y, z);
+
+			if (msl_options.fp64_mode == FP64Mode::TripleFloat)
+			{
+				float x, y, z;
+				split_double_tf(value, x, y, z);
+				snprintf(buf, sizeof(buf), "%s{%.9e, %.9e, %.9e}",
+				         get_fp64_type_name(msl_options.fp64_mode), x, y, z);
+			}
+			else
+			{
+				float x, y;
+				split_double_df(value, x, y);
+				snprintf(buf, sizeof(buf), "%s{%.9e, %.9e}",
+				         get_fp64_type_name(msl_options.fp64_mode), x, y);
+			}
+
 			return std::string(buf);
-		}
-		else
-		{
-			split_double_df(value, x, y);
-			char buf[256];
-			snprintf(buf, sizeof(buf), "%s{%.9e, %.9e}",
-			         get_fp64_type_name(msl_options.fp64_mode), x, y);
-			return std::string(buf);
-		}
+		};
+
+		if (type.vecsize == 1)
+			return scalar(0);
+
+		std::string expr = get_fp64_composite_type_name(msl_options.fp64_mode, type.vecsize, 1) + "{";
+		for (uint32_t row = 0; row < type.vecsize; row++)
+			expr += (row ? ", " : "") + scalar(row);
+		return expr + "}";
 	}
 	return CompilerGLSL::constant_expression_vector(c, vector);
 }
@@ -6187,17 +6495,26 @@ void CompilerMSL::emit_custom_functions()
 	// double in it. Otherwise every shader in the program carries 185 lines of
 	// arithmetic it never calls.
 	bool module_uses_fp64 = false;
+	bool module_uses_fp64_composite = false;
+	bool module_uses_fp64_matrix = false;
 	if (msl_options.fp64_mode != FP64Mode::Disabled)
 	{
 		ir.for_each_typed_id<SPIRType>([&](uint32_t, const SPIRType &t) {
-			if (t.basetype == SPIRType::Double)
-				module_uses_fp64 = true;
+			if (t.basetype != SPIRType::Double)
+				return;
+			module_uses_fp64 = true;
+			if (t.vecsize > 1 || t.columns > 1)
+				module_uses_fp64_composite = true;
+			if (t.columns > 1)
+				module_uses_fp64_matrix = true;
 		});
 	}
 
 	if (module_uses_fp64)
 	{
 		statement(get_fp64_msl_prelude(msl_options.fp64_mode));
+		if (module_uses_fp64_composite)
+			statement(get_fp64_composite_prelude(msl_options.fp64_mode, module_uses_fp64_matrix));
 		statement("");
 	}
 
@@ -9542,6 +9859,15 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
 	// For packed types, we could technically omit this if we know the reference does not have to turn into a pointer
 	// of some kind, but that requires external analysis passes to figure out, and
 	// this case is likely rare enough that we don't need to bother.
+	// An emulated double already sits in an array of its binary64 slots, so a
+	// component is one element of that. Casting it to the float form would
+	// read the bits as if they were already floats.
+	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double)
+	{
+		is_packed = true;
+		return true;
+	}
+
 	if (storage == StorageClassStorageBuffer || storage == StorageClassWorkgroup)
 	{
 		const char *addr_space = storage == StorageClassWorkgroup ? "threadgroup" : "device";
@@ -9553,6 +9879,20 @@ bool CompilerMSL::prepare_access_chain_for_scalar_access(std::string &expr, cons
 	}
 	else
 		return false;
+}
+
+// An emulated dmat is a struct of columns, so its constant form is a brace
+// initialiser rather than a constructor call.
+bool CompilerMSL::composite_constant_needs_braces(const SPIRType &type) const
+{
+	return msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double;
+}
+
+// The slots a double is stored in still need decoding after a component of it
+// has been picked out, so the storage type must survive the access chain.
+bool CompilerMSL::keep_physical_type_for_scalar_access(const SPIRType &type) const
+{
+	return msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double;
 }
 
 bool CompilerMSL::access_chain_needs_stage_io_builtin_translation(uint32_t base)
@@ -9645,6 +9985,162 @@ bool CompilerMSL::check_physical_type_cast(std::string &expr, const SPIRType *ty
 }
 
 // Override for MSL-specific syntax instructions
+// The instructions that need a different shape only when the value is an
+// emulated double. Kept out of the main switch so that a shader without one
+// takes exactly the path it always did. Returns true when it has emitted the
+// instruction itself.
+bool CompilerMSL::emit_fp64_instruction(const Instruction &instruction)
+{
+	if (msl_options.fp64_mode == FP64Mode::Disabled)
+		return false;
+
+	auto ops = stream(instruction);
+	auto opcode = get_remapped_spirv_op(static_cast<Op>(instruction.op));
+
+	auto is_fp64 = [this](uint32_t type_id) -> bool {
+		return get<SPIRType>(type_id).basetype == SPIRType::Double;
+	};
+	auto expr_is_fp64 = [this](uint32_t expr_id) -> bool {
+		return expression_type(expr_id).basetype == SPIRType::Double;
+	};
+
+	switch (opcode)
+	{
+	// An emulated dvec is a struct, so it has no constructor call and no
+	// swizzle. Both become a brace-initialiser naming every component.
+	case OpCompositeConstruct:
+		if (is_fp64(ops[0]) && (get<SPIRType>(ops[0]).vecsize > 1 || get<SPIRType>(ops[0]).columns > 1))
+		{
+			auto &type = get<SPIRType>(ops[0]);
+			uint32_t count = instruction.length - 2;
+			std::string expr = type_to_glsl(type) + "{";
+			bool first = true;
+			bool forward = true;
+			for (uint32_t i = 0; i < count; i++)
+			{
+				uint32_t arg = ops[2 + i];
+				auto &arg_type = expression_type(arg);
+				forward = forward && should_forward(arg);
+				// A matrix is built from whole columns; a vector from single
+				// components, and an argument that is itself a vector gives up
+				// all of them.
+				if (type.columns > 1 || arg_type.vecsize == 1)
+				{
+					expr += first ? "" : ", ";
+					expr += to_unpacked_expression(arg);
+					first = false;
+				}
+				else
+				{
+					for (uint32_t c = 0; c < arg_type.vecsize; c++)
+					{
+						expr += first ? "" : ", ";
+						expr += fp64_component_expression(arg, c);
+						first = false;
+					}
+				}
+			}
+			emit_op(ops[0], ops[1], expr + "}", forward);
+			for (uint32_t i = 0; i < count; i++)
+				inherit_expression_dependencies(ops[1], ops[2 + i]);
+			return true;
+		}
+		return false;
+
+	// Naming a component of an emulated vector means decoding it first, and a
+	// matrix column is a named member rather than an index.
+	case OpCompositeExtract:
+		if (expr_is_fp64(ops[2]) &&
+		    (expression_type(ops[2]).vecsize > 1 || expression_type(ops[2]).columns > 1))
+		{
+			auto &base_type = expression_type(ops[2]);
+			std::string expr = enclose_expression(to_unpacked_expression(ops[2]));
+			uint32_t count = instruction.length - 3;
+			for (uint32_t i = 0; i < count; i++)
+			{
+				uint32_t index = ops[3 + i];
+				if (base_type.columns > 1 && i == 0)
+					expr += join(".c", index);
+				else
+					expr += join(".", index_to_swizzle(index));
+			}
+			emit_op(ops[0], ops[1], expr, should_forward(ops[2]));
+			inherit_expression_dependencies(ops[1], ops[2]);
+			return true;
+		}
+		return false;
+
+	case OpIsNan:
+	case OpIsInf:
+		if (expr_is_fp64(ops[2]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_func_name(opcode == OpIsNan ? "isnan" : "isinf", msl_options.fp64_mode));
+			return true;
+		}
+		return false;
+
+	case OpVectorShuffle:
+		if (is_fp64(ops[0]) && get<SPIRType>(ops[0]).vecsize > 1)
+		{
+			uint32_t left = ops[2], right = ops[3];
+			uint32_t left_size = expression_type(left).vecsize;
+			uint32_t count = instruction.length - 4;
+			std::string expr = type_to_glsl(get<SPIRType>(ops[0])) + "{";
+			for (uint32_t i = 0; i < count; i++)
+			{
+				uint32_t index = ops[4 + i];
+				expr += i ? ", " : "";
+				if (index == 0xffffffffu)
+					expr += type_to_glsl(get<SPIRType>(ops[0])) + "{}." + index_to_swizzle(0);
+				else if (index < left_size)
+					expr += fp64_component_expression(left, index);
+				else
+					expr += fp64_component_expression(right, index - left_size);
+			}
+			emit_op(ops[0], ops[1], expr + "}", should_forward(left) && should_forward(right));
+			inherit_expression_dependencies(ops[1], left);
+			inherit_expression_dependencies(ops[1], right);
+			return true;
+		}
+		return false;
+
+	// Every emulated-double product is the same call; the prelude picks the
+	// right one from the argument shapes.
+	case OpVectorTimesScalar:
+	case OpMatrixTimesScalar:
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("mul", msl_options.fp64_mode));
+			return true;
+		}
+		return false;
+
+	case OpDot:
+		if (is_fp64(ops[0]))
+		{
+			uint32_t n = expression_type(ops[2]).vecsize;
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_dot_name(int(n), msl_options.fp64_mode));
+			return true;
+		}
+		return false;
+
+	case OpTranspose:
+		if (is_fp64(ops[0]))
+		{
+			emit_unary_func_op(ops[0], ops[1], ops[2],
+			                   get_fp64_func_name("transpose", msl_options.fp64_mode));
+			return true;
+		}
+		return false;
+
+	default:
+		return false;
+	}
+}
+
 void CompilerMSL::emit_instruction(const Instruction &instruction)
 {
 #define MSL_BOP(op) emit_binary_op(ops[0], ops[1], ops[2], ops[3], #op)
@@ -9665,6 +10161,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	auto opcode = static_cast<Op>(instruction.op);
 
 	opcode = get_remapped_spirv_op(opcode);
+
+	if (emit_fp64_instruction(instruction))
+		return;
 
 	// If we need to do implicit bitcasts, make sure we do it with the correct type.
 	uint32_t integer_width = get_integer_width_for_instruction(instruction);
@@ -9688,6 +10187,7 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	{
 		uint32_t id = ops[1];
 		uint32_t ptr = ops[2];
+
 		if (is_tessellation_shader())
 		{
 			if (!emit_tessellation_io_load(ops[0], id, ptr))
@@ -9828,38 +10328,62 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpFUnordEqual:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_eq", msl_options.fp64_mode));
+			break;
+		}
 		MSL_UNORD_BOP(==);
 		break;
 
 	case OpFUnordNotEqual:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_ne", msl_options.fp64_mode));
+			break;
+		}
 		MSL_BOP(!=);
 		break;
 
 	case OpFUnordGreaterThan:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_gt", msl_options.fp64_mode));
+			break;
+		}
 		MSL_UNORD_BOP(>);
 		break;
 
 	case OpFUnordGreaterThanEqual:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_ge", msl_options.fp64_mode));
+			break;
+		}
 		MSL_UNORD_BOP(>=);
 		break;
 
 	case OpFUnordLessThan:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_lt", msl_options.fp64_mode));
+			break;
+		}
 		MSL_UNORD_BOP(<);
 		break;
 
 	case OpFUnordLessThanEqual:
-		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: unordered comparisons on double are not implemented.");
+		if (expr_is_fp64(ops[2]) || expr_is_fp64(ops[3]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("un_le", msl_options.fp64_mode));
+			break;
+		}
 		MSL_UNORD_BOP(<=);
 		break;
 
@@ -9935,9 +10459,23 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		MSL_BFOP(spvSMod);
 		break;
 
+	case OpFMod:
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("mod", msl_options.fp64_mode));
+			break;
+		}
+		CompilerGLSL::emit_instruction(instruction);
+		break;
+
 	case OpFRem:
 		if (is_fp64(ops[0]))
-			SPIRV_CROSS_THROW("fp64 emulation: OpFRem on double is not implemented.");
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("rem", msl_options.fp64_mode));
+			break;
+		}
 		MSL_BFOP(fmod);
 		break;
 
@@ -9954,8 +10492,11 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	case OpFMul:
 		if (is_fp64(ops[0]))
 		{
+			// On matrices this opcode is component-wise, which is a different
+			// function from the matrix product.
+			bool matrix = get<SPIRType>(ops[0]).columns > 1;
 			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
-			                   get_fp64_func_name("mul", msl_options.fp64_mode));
+			                   get_fp64_func_name(matrix ? "compmult" : "mul", msl_options.fp64_mode));
 		}
 		else if (msl_options.invariant_float_math || has_legacy_nocontract(ops[0], ops[1]))
 			MSL_BFOP(spvFMul);
@@ -10475,6 +11016,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		uint32_t a = ops[2];
 		uint32_t b = ops[3];
 
+		if (is_fp64(result_type))
+		{
+			emit_binary_func_op(result_type, id, a, b, get_fp64_func_name("outer", msl_options.fp64_mode));
+			break;
+		}
+
 		auto &type = get<SPIRType>(result_type);
 		string expr = type_to_glsl_constructor(type);
 		expr += "(";
@@ -10496,6 +11043,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 	case OpVectorTimesMatrix:
 	case OpMatrixTimesVector:
 	{
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("mul", msl_options.fp64_mode));
+			break;
+		}
+
 		if (!msl_options.invariant_float_math && !has_legacy_nocontract(ops[0], ops[1]))
 		{
 			CompilerGLSL::emit_instruction(instruction);
@@ -10538,6 +11092,13 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 	case OpMatrixTimesMatrix:
 	{
+		if (is_fp64(ops[0]))
+		{
+			emit_binary_func_op(ops[0], ops[1], ops[2], ops[3],
+			                    get_fp64_func_name("mul", msl_options.fp64_mode));
+			break;
+		}
+
 		if (!msl_options.invariant_float_math && !has_legacy_nocontract(ops[0], ops[1]))
 		{
 			CompilerGLSL::emit_instruction(instruction);
@@ -12011,6 +12572,134 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 	op = get_remapped_glsl_op(op);
 
 	auto &restype = get<SPIRType>(result_type);
+
+	// Emulated doubles have no operators and no library, so every builtin is a
+	// call into the prelude. The width decides which overload Metal picks,
+	// except for the geometric ones, whose names carry it.
+	if (msl_options.fp64_mode != FP64Mode::Disabled &&
+	    (restype.basetype == SPIRType::Double ||
+	     (count > 0 && expression_type(args[0]).basetype == SPIRType::Double)))
+	{
+		auto mode = msl_options.fp64_mode;
+		auto vecsize = [this](uint32_t arg) { return int(expression_type(arg).vecsize); };
+		const char *fn = nullptr;
+
+		switch (op)
+		{
+		case GLSLstd450FAbs: fn = "abs"; break;
+		case GLSLstd450Sqrt: fn = "sqrt"; break;
+		case GLSLstd450InverseSqrt: fn = "inversesqrt"; break;
+		case GLSLstd450Floor: fn = "floor"; break;
+		case GLSLstd450Ceil: fn = "ceil"; break;
+		case GLSLstd450Trunc: fn = "trunc"; break;
+		case GLSLstd450Round: fn = "round"; break;
+		case GLSLstd450RoundEven: fn = "roundeven"; break;
+		case GLSLstd450FSign: fn = "sign"; break;
+		case GLSLstd450Fract: fn = "fract"; break;
+		case GLSLstd450FMin:
+		case GLSLstd450NMin: fn = "min"; break;
+		case GLSLstd450FMax:
+		case GLSLstd450NMax: fn = "max"; break;
+		case GLSLstd450FClamp:
+		case GLSLstd450NClamp: fn = "clamp"; break;
+		case GLSLstd450FMix: fn = "mix"; break;
+		case GLSLstd450Step: fn = "step"; break;
+		case GLSLstd450SmoothStep: fn = "smoothstep"; break;
+		case GLSLstd450Fma: fn = "fma"; break;
+		case GLSLstd450Cross: fn = "cross"; break;
+		case GLSLstd450Determinant: fn = "determinant"; break;
+		case GLSLstd450MatrixInverse: fn = "inverse"; break;
+		case GLSLstd450Ldexp: fn = "ldexp"; break;
+		default: break;
+		}
+
+		if (fn)
+		{
+			auto name = get_fp64_func_name(fn, mode);
+			if (count == 1)
+				emit_unary_func_op(result_type, id, args[0], name);
+			else if (count == 2)
+				emit_binary_func_op(result_type, id, args[0], args[1], name);
+			else
+				emit_trinary_func_op(result_type, id, args[0], args[1], args[2], name);
+			return;
+		}
+
+		// These carry the width in the name, because the argument alone does
+		// not say it: length(dvec3) and length(dvec4) both return a scalar.
+		switch (op)
+		{
+		case GLSLstd450Length:
+			emit_unary_func_op(result_type, id, args[0], get_fp64_length_name(vecsize(args[0]), mode));
+			return;
+		case GLSLstd450Distance:
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                    get_fp64_distance_name(vecsize(args[0]), mode));
+			return;
+		case GLSLstd450Normalize:
+			emit_unary_func_op(result_type, id, args[0], get_fp64_normalize_name(vecsize(args[0]), mode));
+			return;
+		case GLSLstd450Reflect:
+			emit_binary_func_op(result_type, id, args[0], args[1],
+			                    join(get_fp64_func_name("reflect", mode), vecsize(args[0])).c_str());
+			return;
+		case GLSLstd450Refract:
+			emit_trinary_func_op(result_type, id, args[0], args[1], args[2],
+			                     join(get_fp64_func_name("refract", mode), vecsize(args[0])).c_str());
+			return;
+		case GLSLstd450FaceForward:
+			emit_trinary_func_op(result_type, id, args[0], args[1], args[2],
+			                     join(get_fp64_func_name("faceforward", mode), vecsize(args[0])).c_str());
+			return;
+		case GLSLstd450PackDouble2x32:
+			emit_unary_func_op(result_type, id, args[0], get_fp64_decode_name(mode));
+			return;
+		case GLSLstd450UnpackDouble2x32:
+			emit_unary_func_op(result_type, id, args[0], get_fp64_encode_name(mode));
+			return;
+
+		// These two hand back a second value. In the pointer forms it goes to
+		// the caller's variable, in the struct forms into the result's members.
+		case GLSLstd450Modf:
+			statement(to_dereferenced_expression(args[1]), " = ", get_fp64_func_name("trunc", mode), "(",
+			          to_unpacked_expression(args[0]), ");");
+			emit_op(result_type, id,
+			        join(get_fp64_func_name("sub", mode), "(", to_unpacked_expression(args[0]), ", ",
+			             to_dereferenced_expression(args[1]), ")"),
+			        false);
+			register_write(args[1]);
+			return;
+		case GLSLstd450Frexp:
+			emit_op(result_type, id,
+			        join(get_fp64_func_name("frexp", mode), "(", to_unpacked_expression(args[0]), ", ",
+			             to_dereferenced_expression(args[1]), ")"),
+			        false);
+			register_write(args[1]);
+			return;
+		case GLSLstd450ModfStruct:
+		{
+			auto &struct_type = get<SPIRType>(result_type);
+			emit_uninitialized_temporary_expression(result_type, id);
+			statement(to_expression(id), ".", to_member_name(struct_type, 1), " = ",
+			          get_fp64_func_name("trunc", mode), "(", to_unpacked_expression(args[0]), ");");
+			statement(to_expression(id), ".", to_member_name(struct_type, 0), " = ",
+			          get_fp64_func_name("sub", mode), "(", to_unpacked_expression(args[0]), ", ",
+			          to_expression(id), ".", to_member_name(struct_type, 1), ");");
+			return;
+		}
+		case GLSLstd450FrexpStruct:
+		{
+			auto &struct_type = get<SPIRType>(result_type);
+			emit_uninitialized_temporary_expression(result_type, id);
+			statement(to_expression(id), ".", to_member_name(struct_type, 0), " = ",
+			          get_fp64_func_name("frexp", mode), "(", to_unpacked_expression(args[0]), ", ",
+			          to_expression(id), ".", to_member_name(struct_type, 1), ");");
+			return;
+		}
+		default:
+			SPIRV_CROSS_THROW(join("fp64 emulation: GLSL builtin ", uint32_t(op), " on double is not implemented."));
+		}
+	}
 
 	// Only precise:: preserves NaN in trancendentals (supposedly, cannot find documentation for this).
 	const auto drop_nan_inf = FPFastMathModeNotInfMask | FPFastMathModeNotNaNMask;
@@ -15847,7 +16536,15 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 		default:
 			if (!ep_args.empty())
 				ep_args += ", ";
-			if (!type.pointer)
+			// A bare double uniform is a run of binary64 slots, so it arrives
+			// as a pointer to them rather than as the value.
+			if (is_fp64_plain_uniform(var_id))
+			{
+				ep_args += get_type_address_space(get<SPIRType>(var.basetype), var_id) + " uint2* " +
+				           fp64_plain_uniform_slots_name(var_id);
+				fp64_plain_uniforms_with_args.insert(var_id);
+			}
+			else if (!type.pointer)
 				ep_args += get_type_address_space(get<SPIRType>(var.basetype), var_id) + " " +
 				           type_to_glsl(type, var_id) + "& " + r.name;
 			else
@@ -17633,15 +18330,8 @@ string CompilerMSL::type_to_glsl(const SPIRType &type, uint32_t id, bool member)
 	case SPIRType::Double:
 		if (msl_options.fp64_mode != FP64Mode::Disabled)
 		{
-			// A double is a struct of floats here, so the vector and matrix
-			// forms would need per-component lowering that does not exist yet.
-			// Saying so is better than emitting MSL that Metal rejects with a
-			// message about a type the shader author never wrote.
-			if (type.columns > 1)
-				SPIRV_CROSS_THROW("fp64 emulation: dmat types are not implemented.");
-			if (type.vecsize > 1)
-				SPIRV_CROSS_THROW("fp64 emulation: dvec types are not implemented.");
-
+			// A double is a struct of floats, so dvec and dmat are structs of
+			// those. The names line up with what the prelude declares.
 			type_name = get_fp64_type_name(msl_options.fp64_mode);
 		}
 		else

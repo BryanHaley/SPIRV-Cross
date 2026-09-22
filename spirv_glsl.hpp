@@ -800,6 +800,8 @@ protected:
 	virtual bool check_physical_type_cast(std::string &expr, const SPIRType *type, uint32_t physical_type);
 	virtual bool prepare_access_chain_for_scalar_access(std::string &expr, const SPIRType &type,
 	                                                    StorageClass storage, bool &is_packed);
+	virtual bool keep_physical_type_for_scalar_access(const SPIRType &type) const;
+	virtual bool composite_constant_needs_braces(const SPIRType &type) const;
 
 	std::string access_chain(uint32_t base, const uint32_t *indices, uint32_t count, const SPIRType &target_type,
 	                         AccessChainMeta *meta = nullptr, bool ptr_chain = false,

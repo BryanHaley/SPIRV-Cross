@@ -9,6 +9,7 @@
 #include <string>
 #include <stdint.h>
 
+
 // SPIRV_CROSS_NAMESPACE is provided by spirv_msl.hpp when included from there.
 #ifndef SPIRV_CROSS_NAMESPACE
 #define SPIRV_CROSS_NAMESPACE spirv_cross
@@ -28,6 +29,13 @@ enum class FP64Mode : uint8_t
 
 // Returns the MSL prelude string that must be emitted before any shader code.
 const char *get_fp64_msl_prelude(FP64Mode mode);
+
+// The vector and matrix half of the prelude. Emitted right after the scalar
+// part, and only when the shader actually uses a dvec or a dmat.
+std::string get_fp64_composite_prelude(FP64Mode mode, bool want_matrices);
+
+// Name of the MSL type for a vecsize x columns emulated double.
+std::string get_fp64_composite_type_name(FP64Mode mode, uint32_t vecsize, uint32_t columns);
 
 // Returns the MSL scalar type name for the emulated double.
 const char *get_fp64_type_name(FP64Mode mode);

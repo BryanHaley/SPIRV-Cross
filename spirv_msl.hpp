@@ -1010,6 +1010,18 @@ protected:
 	// Non-zero when this variable lives in a stage interface block as an
 	// emulated double, i.e. declared uint2 but written as MGLtf.
 	uint32_t fp64_interface_storage_type(uint32_t var_id) const;
+	std::string fp64_decode_expression(const SPIRType &type, const SPIRType &physical_type,
+	                                   const std::string &expr_str);
+	void fp64_emit_encode_store(const std::string &lhs, const SPIRType &type, const SPIRType *physical_type,
+	                            const std::string &rhs);
+	SPIRType get_fp64_column_type(const SPIRType &type) const;
+	std::string fp64_component_expression(uint32_t id, uint32_t index);
+	bool is_fp64_plain_uniform(uint32_t var_id) const;
+	bool emit_fp64_instruction(const Instruction &instruction);
+	std::string fp64_plain_uniform_expression(uint32_t var_id);
+	std::string fp64_plain_uniform_slots_name(uint32_t var_id);
+	void declare_fp64_plain_uniforms();
+	std::unordered_set<uint32_t> fp64_plain_uniforms_with_args;
 	void mark_as_packable(SPIRType &type);
 	void mark_as_workgroup_struct(SPIRType &type);
 
@@ -1041,6 +1053,8 @@ protected:
 	void emit_local_masked_variable(const SPIRVariable &masked_var, bool strip_array);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,
 	                                     SPIRVariable &var, InterfaceBlockMeta &meta);
+	void add_fp64_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
+	                                          SPIRType &ib_type, SPIRVariable &var, InterfaceBlockMeta &meta);
 	void add_composite_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
 	                                               SPIRType &ib_type, SPIRVariable &var, InterfaceBlockMeta &meta);
 	void add_plain_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
@@ -1226,6 +1240,8 @@ protected:
 	bool access_chain_needs_stage_io_builtin_translation(uint32_t base) override;
 	bool prepare_access_chain_for_scalar_access(std::string &expr, const SPIRType &type, StorageClass storage,
 	                                            bool &is_packed) override;
+	bool keep_physical_type_for_scalar_access(const SPIRType &type) const override;
+	bool composite_constant_needs_braces(const SPIRType &type) const override;
 	void fix_up_interpolant_access_chain(const uint32_t *ops, uint32_t length);
 	bool check_physical_type_cast(std::string &expr, const SPIRType *type, uint32_t physical_type) override;
 
