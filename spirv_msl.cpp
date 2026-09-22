@@ -13065,11 +13065,12 @@ void CompilerMSL::emit_glsl_op(uint32_t result_type, uint32_t id, uint32_t eop, 
 				component = join(".", index_to_swizzle(c->scalar()));
 		}
 		// Like Direct3D, Metal puts the (0, 0) at the upper-left corner, not the center as SPIR-V and GLSL do.
-		// Offset the offset by (1/2 - 1/16), or 0.4375, to compensate for this.
-		// It has to be (1/2 - 1/16) and not 1/2, or several CTS tests subtly break on Intel.
+		// Offset the offset by half a pixel to compensate for this. Upstream
+		// takes off another 1/16 for Intel, which lands a sixteenth of a pixel
+		// away from the sample it was asked for on Apple hardware.
 		emit_op(result_type, id,
 		        join(to_name(stage_in_var_id), ".", to_member_name(get_stage_in_struct_type(), interface_index),
-		             ".interpolate_at_offset(", to_expression(args[1]), " + 0.4375)", component),
+		             ".interpolate_at_offset(", to_expression(args[1]), " + 0.5)", component),
 		        should_forward(args[0]) && should_forward(args[1]));
 		break;
 	}
