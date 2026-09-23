@@ -664,6 +664,8 @@ struct CLIArguments
 	bool msl_enable_clip_distance_user_varying = true;
 	bool msl_raw_buffer_tese_input = false;
 	bool msl_multi_patch_workgroup = false;
+	bool msl_plain_tessellation_io = false;
+	bool msl_cull_distance_varyings = false;
 	bool msl_vertex_for_tessellation = false;
 	uint32_t msl_additional_fixed_sample_mask = 0xffffffff;
 	bool msl_arrayed_subpass_input = false;
@@ -1288,6 +1290,8 @@ static string compile_iteration(const CLIArguments &args, std::vector<uint32_t> 
 		msl_opts.enable_clip_distance_user_varying = args.msl_enable_clip_distance_user_varying;
 		msl_opts.raw_buffer_tese_input = args.msl_raw_buffer_tese_input;
 		msl_opts.multi_patch_workgroup = args.msl_multi_patch_workgroup;
+		msl_opts.plain_tessellation_io = args.msl_plain_tessellation_io;
+		msl_opts.cull_distance_varyings = args.msl_cull_distance_varyings;
 		msl_opts.vertex_for_tessellation = args.msl_vertex_for_tessellation;
 		msl_opts.additional_fixed_sample_mask = args.msl_additional_fixed_sample_mask;
 		msl_opts.arrayed_subpass_input = args.msl_arrayed_subpass_input;
@@ -1896,6 +1900,8 @@ static int main_inner(int argc, char *argv[])
 	});
 	cbs.add("--msl-raw-buffer-tese-input", [&args](CLIParser &) { args.msl_raw_buffer_tese_input = true; });
 	cbs.add("--msl-multi-patch-workgroup", [&args](CLIParser &) { args.msl_multi_patch_workgroup = true; });
+	cbs.add("--msl-plain-tessellation-io", [&args](CLIParser &) { args.msl_plain_tessellation_io = true; });
+	cbs.add("--msl-cull-distance-varyings", [&args](CLIParser &) { args.msl_cull_distance_varyings = true; });
 	cbs.add("--msl-vertex-for-tessellation", [&args](CLIParser &) { args.msl_vertex_for_tessellation = true; });
 	cbs.add("--msl-additional-fixed-sample-mask",
 	        [&args](CLIParser &parser) { args.msl_additional_fixed_sample_mask = parser.next_hex_uint(); });

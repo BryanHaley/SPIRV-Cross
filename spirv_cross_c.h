@@ -375,6 +375,7 @@ typedef struct spvc_msl_shader_interface_var_2
 	SpvBuiltIn builtin;
 	unsigned vecsize;
 	spvc_msl_shader_variable_rate rate;
+	unsigned component;
 } spvc_msl_shader_interface_var_2;
 
 /*
@@ -757,6 +758,9 @@ typedef enum spvc_compiler_option
 
 	SPVC_COMPILER_OPTION_MSL_FP64_MODE = 95 | SPVC_COMPILER_OPTION_MSL_BIT,
 
+	SPVC_COMPILER_OPTION_MSL_PLAIN_TESSELLATION_IO = 96 | SPVC_COMPILER_OPTION_MSL_BIT,
+	SPVC_COMPILER_OPTION_MSL_CULL_DISTANCE_VARYINGS = 97 | SPVC_COMPILER_OPTION_MSL_BIT,
+
 	SPVC_COMPILER_OPTION_INT_MAX = 0x7fffffff
 } spvc_compiler_option;
 
@@ -852,6 +856,11 @@ SPVC_PUBLIC_API spvc_bool spvc_compiler_hlsl_is_resource_used(spvc_compiler comp
  * Maps to C++ API.
  */
 SPVC_PUBLIC_API spvc_bool spvc_compiler_msl_is_rasterization_disabled(spvc_compiler compiler);
+/* MGL: the shader does atomics on this image variable */
+SPVC_PUBLIC_API spvc_bool spvc_compiler_msl_is_image_used_atomically(spvc_compiler compiler, spvc_variable_id id);
+/* MGL: a storage cube image declared as a 2D array of faces for its atomics */
+SPVC_PUBLIC_API spvc_bool spvc_compiler_msl_is_cube_image_emulated_as_array(spvc_compiler compiler, spvc_type_id id,
+                                                                            spvc_bool *was_arrayed);
 
 /* Obsolete. Renamed to needs_swizzle_buffer. */
 SPVC_PUBLIC_API spvc_bool spvc_compiler_msl_needs_aux_buffer(spvc_compiler compiler);

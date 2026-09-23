@@ -557,6 +557,17 @@ public:
 		// IMPORTANT: generated MSL must be compiled with MTLMathModeSafe.
 		FP64Mode fp64_mode = FP64Mode::Disabled;
 
+		// Every tessellation interface is a buffer the next stage reads as a plain struct
+		// (multi_patch_workgroup control, raw_buffer_tese_input evaluation), so variables
+		// sharing a location through Component need no packing. Set it on the vertex,
+		// control and evaluation stages alike, or the two sides of a buffer disagree.
+		bool plain_tessellation_io = false;
+
+		// MGL: Metal has no cull distance output, so the builtin is masked
+		// into a local. With this set, each element also goes out as a
+		// user(cullN) varying for a fragment shader that reads gl_CullDistance.
+		bool cull_distance_varyings = false;
+
 		bool is_ios() const
 		{
 			return platform == iOS;
@@ -600,6 +611,18 @@ public:
 
 	// Provide feedback to calling API to allow runtime to disable pipeline
 	// rasterization if vertex shader requires rasterization to be disabled.
+	// MGL: before MSL 4.0 Metal has no atomics on cube textures, so a storage
+	// cube image in a shader that uses image atomics is declared as a 2D array
+	// of its faces. True when images of this type were; was_arrayed says the
+	// GL image was a cube array.
+	bool is_cube_image_emulated_as_array(uint32_t type_id, bool *was_arrayed = nullptr) const;
+
+	// MGL: whether the shader does atomics on this image variable
+	bool is_image_used_atomically(uint32_t var_id) const
+	{
+		return atomic_image_vars.count(var_id) != 0;
+	}
+
 	bool get_is_rasterization_disabled() const
 	{
 		return is_rasterization_disabled && (get_entry_point().model == ExecutionModelVertex ||
@@ -1096,6 +1119,15 @@ protected:
 	void emit_interface_block(uint32_t ib_var_id);
 	bool maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs);
 	bool is_var_runtime_size_array(const SPIRVariable &var) const;
+	// MGL: a plain GL uniform (not a block) that is an array of structs lives
+	// in one buffer, not one buffer per element the way a block array does.
+	bool is_plain_uniform_struct_array(const SPIRVariable &var) const;
+
+	// MGL: base image type id -> whether it was a cube array
+	std::unordered_map<uint32_t, bool> cube_images_as_arrays;
+	bool cube_images_retyped = false;
+	void retype_atomic_cube_images();
+	uint32_t base_image_type_id(uint32_t type_id) const;
 	uint32_t get_resource_array_size(const SPIRType &type, uint32_t id) const;
 
 	void fix_up_shader_inputs_outputs();
@@ -1353,6 +1385,7 @@ protected:
 	std::unordered_set<uint32_t> buffers_requiring_array_length;
 	SmallVector<uint32_t> buffer_aliases_discrete;
 	std::unordered_set<uint32_t> atomic_image_vars_emulated; // Emulate texture2D atomic operations
+	std::unordered_set<uint32_t> atomic_image_vars; // MGL: every image an atomic touches
 	std::unordered_set<uint32_t> pull_model_inputs;
 	std::unordered_set<uint32_t> recursive_inputs;
 
@@ -1432,6 +1465,7 @@ protected:
 
 		CompilerMSL &self;
 		std::unordered_map<uint32_t, uint32_t> image_pointers_emulated; // Emulate texture2D atomic operations
+		std::unordered_map<uint32_t, uint32_t> image_pointers_all; // MGL: every texel pointer, to its image
 		bool suppress_missing_prototypes = false;
 		bool uses_atomics = false;
 		bool uses_image_write = false;

@@ -300,14 +300,28 @@ static inline MGLtf MGLtf_max(MGLtf a, MGLtf b) {
 }
 
 // ---- triple-float comparisons ----
-static inline bool MGLtf_eq(MGLtf a, MGLtf b) { return (a.x == b.x) && (a.y == b.y) && (a.z == b.z); }
+// One value has many splits into three floats -- a double freshly decoded
+// from its bits is split differently from the same double written as a
+// literal -- so both sides are put in the one non-overlapping form before
+// their parts are compared.
+static inline bool MGLtf_eq(MGLtf a_in, MGLtf b_in) {
+    // an infinity or NaN is all in the top part, and canon would turn the
+    // rest into NaN
+    if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x == b_in.x;
+    MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
+    return (a.x == b.x) && (a.y == b.y) && (a.z == b.z);
+}
 static inline bool MGLtf_ne(MGLtf a, MGLtf b) { return !MGLtf_eq(a, b); }
-static inline bool MGLtf_lt(MGLtf a, MGLtf b) {
+static inline bool MGLtf_lt(MGLtf a_in, MGLtf b_in) {
+    if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x < b_in.x;
+    MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
     if (a.x != b.x) return a.x < b.x;
     if (a.y != b.y) return a.y < b.y;
     return a.z < b.z;
 }
-static inline bool MGLtf_le(MGLtf a, MGLtf b) {
+static inline bool MGLtf_le(MGLtf a_in, MGLtf b_in) {
+    if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x <= b_in.x;
+    MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
     if (a.x != b.x) return a.x < b.x;
     if (a.y != b.y) return a.y < b.y;
     return a.z <= b.z;
@@ -523,7 +537,7 @@ struct Emitter
 };
 } // namespace
 
-std::string get_fp64_composite_prelude(FP64Mode mode, bool want_matrices)
+std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool want_matrices)
 {
 	if (mode == FP64Mode::Disabled)
 		return {};
@@ -585,6 +599,12 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_matrices)
 		       "_isnan(a) || " + P + "_isnan(b) || " + P + "_" + c + "(a, b); }");
 	e.line("static inline bool " + P + "_un_ne(" + P + " a, " + P + " b) { return " + P + "_ne(a, b); }");
 	e.line("");
+
+	// Everything above is scalar and a plain double needs it: glslang turns
+	// "!=" on floats into an unordered compare, so a shader with no dvec at all
+	// still calls _un_ne.
+	if (!want_vectors)
+		return e.out;
 
 	// ---- vector types ----
 	e.line("// ---- Vector types ----");

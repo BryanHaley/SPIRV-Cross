@@ -787,6 +787,14 @@ spvc_result spvc_compiler_options_set_uint(spvc_compiler_options options, spvc_c
 	case SPVC_COMPILER_OPTION_MSL_FP64_MODE:
 		options->msl.fp64_mode = static_cast<FP64Mode>(value);
 		break;
+
+	case SPVC_COMPILER_OPTION_MSL_PLAIN_TESSELLATION_IO:
+		options->msl.plain_tessellation_io = value != 0;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_CULL_DISTANCE_VARYINGS:
+		options->msl.cull_distance_varyings = value != 0;
+		break;
 #endif
 
 	default:
@@ -1129,6 +1137,50 @@ spvc_bool spvc_compiler_hlsl_is_resource_used(spvc_compiler compiler, SpvExecuti
 #endif
 }
 
+spvc_bool spvc_compiler_msl_is_image_used_atomically(spvc_compiler compiler, spvc_variable_id id)
+{
+#if SPIRV_CROSS_C_API_MSL
+	if (compiler->backend != SPVC_BACKEND_MSL)
+	{
+		compiler->context->report_error("MSL function used on a non-MSL backend.");
+		return SPVC_FALSE;
+	}
+
+	auto &msl = *static_cast<CompilerMSL *>(compiler->compiler.get());
+	return msl.is_image_used_atomically(id) ? SPVC_TRUE : SPVC_FALSE;
+#else
+	(void)id;
+	compiler->context->report_error("MSL function used on a non-MSL backend.");
+	return SPVC_FALSE;
+#endif
+}
+
+spvc_bool spvc_compiler_msl_is_cube_image_emulated_as_array(spvc_compiler compiler, spvc_type_id id,
+                                                            spvc_bool *was_arrayed)
+{
+#if SPIRV_CROSS_C_API_MSL
+	if (compiler->backend != SPVC_BACKEND_MSL)
+	{
+		compiler->context->report_error("MSL function used on a non-MSL backend.");
+		return SPVC_FALSE;
+	}
+
+	auto &msl = *static_cast<CompilerMSL *>(compiler->compiler.get());
+	bool arrayed = false;
+	bool emulated = msl.is_cube_image_emulated_as_array(id, &arrayed);
+
+	if (was_arrayed)
+		*was_arrayed = arrayed ? SPVC_TRUE : SPVC_FALSE;
+
+	return emulated ? SPVC_TRUE : SPVC_FALSE;
+#else
+	(void)id;
+	(void)was_arrayed;
+	compiler->context->report_error("MSL function used on a non-MSL backend.");
+	return SPVC_FALSE;
+#endif
+}
+
 spvc_bool spvc_compiler_msl_is_rasterization_disabled(spvc_compiler compiler)
 {
 #if SPIRV_CROSS_C_API_MSL
@@ -1299,6 +1351,7 @@ spvc_result spvc_compiler_msl_add_shader_input_2(spvc_compiler compiler, const s
 	input.builtin = static_cast<BuiltIn>(si->builtin);
 	input.vecsize = si->vecsize;
 	input.rate = static_cast<MSLShaderVariableRate>(si->rate);
+	input.component = si->component;
 	msl.add_msl_shader_input(input);
 	return SPVC_SUCCESS;
 #else
@@ -1348,6 +1401,7 @@ spvc_result spvc_compiler_msl_add_shader_output_2(spvc_compiler compiler, const 
 	output.builtin = static_cast<BuiltIn>(so->builtin);
 	output.vecsize = so->vecsize;
 	output.rate = static_cast<MSLShaderVariableRate>(so->rate);
+	output.component = so->component;
 	msl.add_msl_shader_output(output);
 	return SPVC_SUCCESS;
 #else
@@ -2864,6 +2918,7 @@ void spvc_msl_shader_interface_var_init_2(spvc_msl_shader_interface_var_2 *var)
 	var->builtin = static_cast<SpvBuiltIn>(var_default.builtin);
 	var->vecsize = var_default.vecsize;
 	var->rate = static_cast<spvc_msl_shader_variable_rate>(var_default.rate);
+	var->component = var_default.component;
 #else
 	memset(var, 0, sizeof(*var));
 #endif
