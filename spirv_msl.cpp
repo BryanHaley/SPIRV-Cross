@@ -3578,13 +3578,24 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 
 	bool mbr_is_indexable = false;
 	uint32_t elem_cnt = 1;
+	// For an array of matrices, the columns of one element; each flattened
+	// member is then element k / mat_cols, column k % mat_cols.
+	uint32_t mbr_mat_cols = 0;
 	if (is_matrix(mbr_type))
 	{
 		if (is_array(mbr_type))
-			SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
+		{
+			// Only a single array dimension, and only where the entry point
+			// copies the variable in and out itself.
+			if (mbr_type.array.size() != 1 || meta.strip_array)
+				SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
+			mbr_mat_cols = mbr_type.columns;
+			elem_cnt = to_array_size_literal(mbr_type) * mbr_mat_cols;
+		}
+		else
+			elem_cnt = mbr_type.columns;
 
 		mbr_is_indexable = true;
-		elem_cnt = mbr_type.columns;
 	}
 	else if (is_array(mbr_type))
 	{
@@ -3627,8 +3638,10 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 	{
 		for (uint32_t i = 0; i < elem_cnt; i++)
 		{
-			string mbr_name = append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? join("_", i) : "");
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string idx_str = mbr_mat_cols ? join("_", i / mbr_mat_cols, "_", i % mbr_mat_cols) : join("_", i);
+			string var_idx_str = mbr_mat_cols ? join("[", i / mbr_mat_cols, "][", i % mbr_mat_cols, "]") : join("[", i, "]");
+			string mbr_name = append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? idx_str : "");
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? var_idx_str : ""));
 			uint32_t sub_mbr_cnt = uint32_t(mbr_type.member_types.size());
 			for (uint32_t sub_mbr_idx = 0; sub_mbr_idx < sub_mbr_cnt; sub_mbr_idx++)
 			{
@@ -3653,7 +3666,8 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 			ib_type.member_types.push_back(usable_type->self);
 
 		// Give the member a name
-		string mbr_name = ensure_valid_name(append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? join("_", i) : ""), "m");
+		string idx_str = mbr_mat_cols ? join("_", i / mbr_mat_cols, "_", i % mbr_mat_cols) : join("_", i);
+		string mbr_name = ensure_valid_name(append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? idx_str : ""), "m");
 		set_member_name(ib_type.self, ib_mbr_idx, mbr_name);
 
 		// The SPIRV location of interface variable, used to obtain the initial
@@ -3745,7 +3759,7 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		// Unflatten or flatten from [[stage_in]] or [[stage_out]] as appropriate.
 		if (!meta.strip_array && meta.allow_local_declaration)
 		{
-			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? join("[", i, "]") : ""));
+			string var_chain = join(var_chain_qual, ".", to_member_name(var_type, mbr_idx), (mbr_is_indexable ? (mbr_mat_cols ? join("[", i / mbr_mat_cols, "][", i % mbr_mat_cols, "]") : join("[", i, "]")) : ""));
 			switch (storage)
 			{
 			case StorageClassInput:
@@ -4278,12 +4292,20 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 			uint32_t location = UINT32_MAX;
 			uint32_t var_mbr_idx = 0;
 			uint32_t elem_cnt = 1;
+			// For an array of matrices, the columns of one element; each flattened
+			// member is then element k / mat_cols, column k % mat_cols.
+			uint32_t blk_mat_cols = 0;
 			if (is_matrix(var_type))
 			{
 				if (is_array(var_type))
-					SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
-
-				elem_cnt = var_type.columns;
+				{
+					if (var_type.array.size() != 1 || meta.strip_array)
+						SPIRV_CROSS_THROW("MSL cannot emit arrays-of-matrices in input and output variables.");
+					blk_mat_cols = var_type.columns;
+					elem_cnt = to_array_size_literal(var_type) * blk_mat_cols;
+				}
+				else
+					elem_cnt = var_type.columns;
 			}
 			else if (is_array(var_type))
 			{
@@ -4353,8 +4375,10 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 						string var_chain_qual = var_name;
 						if (elem_cnt > 1)
 						{
-							mbr_name_qual += join("_", elem_idx);
-							var_chain_qual += join("[", elem_idx, "]");
+							string idx_str = blk_mat_cols ? join("_", elem_idx / blk_mat_cols, "_", elem_idx % blk_mat_cols) : join("_", elem_idx);
+							string var_idx_str = blk_mat_cols ? join("[", elem_idx / blk_mat_cols, "][", elem_idx % blk_mat_cols, "]") : join("[", elem_idx, "]");
+							mbr_name_qual += idx_str;
+							var_chain_qual += var_idx_str;
 						}
 
 						if ((!is_builtin || attribute_load_store) && storage_is_stage_io && is_composite_type)
