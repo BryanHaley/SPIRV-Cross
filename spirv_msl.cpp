@@ -11046,7 +11046,8 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		string expr = type_to_glsl(rslt_type) + "(";
 		expr += img_exp + ".get_width(" + lod + ")";
 
-		if (img_dim == Dim2D || img_dim == DimCube || img_dim == Dim3D)
+		// MGL: a rectangle is a 2D texture, so it has a height too
+		if (img_dim == Dim2D || img_dim == DimRect || img_dim == DimCube || img_dim == Dim3D)
 			expr += ", " + img_exp + ".get_height(" + lod + ")";
 
 		if (img_dim == Dim3D)
@@ -16541,6 +16542,12 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 					    get_decoration(resource.var->self, DecorationBinding) ==
 					    get_decoration(var_id, DecorationBinding))
 					{
+						// MGL: a GL block array sharing a binding with another block reads
+						// the same buffers through its own declaration; MGL binds each one
+						if ((is_array(get_variable_data_type(*resource.var)) && !is_var_runtime_size_array(*resource.var)) ||
+						    (is_array(get_variable_data_type(var)) && !is_var_runtime_size_array(var)))
+							break;
+
 						discrete_descriptor_alias = resource.var;
 						// Self-reference marks that we should declare the resource,
 						// and it's being used as an alias (so we can emit void* instead).
