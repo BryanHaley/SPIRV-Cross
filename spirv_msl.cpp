@@ -2605,15 +2605,27 @@ void CompilerMSL::mark_fp64_struct_members()
 		return;
 
 	SmallVector<uint32_t> struct_ids;
+	std::unordered_set<uint32_t> interface_structs;
 
 	ir.for_each_typed_id<SPIRType>([&](uint32_t id, SPIRType &type) {
 		if (type.basetype == SPIRType::Struct && !type.pointer && type.self == ID(id))
 			struct_ids.push_back(id);
 	});
 
+	// A stage's input and output blocks are values passed between stages.
+	// Their members can carry offsets for transform feedback, but they are
+	// not memory.
+	ir.for_each_typed_id<SPIRVariable>([&](uint32_t, SPIRVariable &var) {
+		if (var.storage == StorageClassInput || var.storage == StorageClassOutput)
+			interface_structs.insert(get_variable_data_type(var).self);
+	});
+
 	for (uint32_t struct_id : struct_ids)
 	{
 		auto &type = get<SPIRType>(struct_id);
+
+		if (interface_structs.count(struct_id))
+			continue;
 
 		for (uint32_t i = 0; i < uint32_t(type.member_types.size()); i++)
 		{
@@ -2638,10 +2650,14 @@ void CompilerMSL::mark_fp64_struct_members()
 			storage_type.vecsize = 2;
 			storage_type.columns = 1;
 			storage_type.parent_type = 0;
+			storage_type.array.clear();
+			storage_type.array_size_literal.clear();
 
 			// A vector is that many binary64 slots in a row. A matrix is an
 			// array of columns, each as long as the block's stride says, so
-			// the padding a dvec3 column carries is part of the column.
+			// the padding a dvec3 column carries is part of the column. The
+			// innermost size goes in first; the member's own array goes last,
+			// outermost.
 			if (mbr_type.columns > 1)
 			{
 				uint32_t stride = has_member_decoration(struct_id, i, DecorationMatrixStride) ?
@@ -2652,10 +2668,29 @@ void CompilerMSL::mark_fp64_struct_members()
 				storage_type.array.push_back(mbr_type.columns);
 				storage_type.array_size_literal.push_back(true);
 			}
-			else if (mbr_type.vecsize > 1)
+			else
 			{
-				storage_type.array.push_back(mbr_type.vecsize);
-				storage_type.array_size_literal.push_back(true);
+				// an array element takes the array's stride, which std140
+				// rounds up past the value itself; a padded double is the low
+				// half of a uint4
+				uint32_t slots = mbr_type.vecsize;
+
+				if (!mbr_type.array.empty() && has_decoration(type.member_types[i], DecorationArrayStride))
+					slots = std::max(slots, get_decoration(type.member_types[i], DecorationArrayStride) / 8);
+
+				if (mbr_type.vecsize == 1 && slots == 2)
+					storage_type.vecsize = 4;
+				else if (slots > 1)
+				{
+					storage_type.array.push_back(slots);
+					storage_type.array_size_literal.push_back(true);
+				}
+			}
+
+			for (size_t d = 0; d < mbr_type.array.size(); d++)
+			{
+				storage_type.array.push_back(mbr_type.array[d]);
+				storage_type.array_size_literal.push_back(mbr_type.array_size_literal[d]);
 			}
 
 			uint32_t type_id = ir.increase_bound_by(1);
@@ -3550,6 +3585,16 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 
 	BuiltIn builtin = BuiltInMax;
 	bool is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
+
+	// MGL: doubles go as binary64 slots, whatever their shape
+	if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && !meta.strip_array &&
+	    meta.allow_local_declaration && (storage == StorageClassInput || storage == StorageClassOutput) &&
+	    get<SPIRType>(var_type.member_types[mbr_idx]).basetype == SPIRType::Double)
+	{
+		add_plain_member_variable_to_interface_block(storage, ib_var_ref, ib_type, var, var_type, mbr_idx, meta,
+		                                             mbr_name_qual, var_chain_qual, location, var_mbr_idx);
+		return;
+	}
 	bool is_flat = interpolation_qual.get(DecorationFlat) ||
 	               has_member_decoration(var_type.self, mbr_idx, DecorationFlat) ||
 	               has_decoration(var.self, DecorationFlat);
@@ -3809,6 +3854,88 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
 
 	BuiltIn builtin = BuiltInMax;
 	bool is_builtin = is_member_builtin(var_type, mbr_idx, &builtin);
+
+	// MGL: a double in a block crosses between stages as its binary64 bits,
+	// one flat uint2 per component, placed the way a plain double varying is.
+	// The block itself stays a local, and the fixups encode and decode.
+	if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && !meta.strip_array &&
+	    meta.allow_local_declaration && (storage == StorageClassInput || storage == StorageClassOutput) &&
+	    get<SPIRType>(var_type.member_types[mbr_idx]).basetype == SPIRType::Double)
+	{
+		const SPIRType &mtype = get<SPIRType>(var_type.member_types[mbr_idx]);
+		uint32_t rows = mtype.vecsize, cols = mtype.columns, col_locs = rows > 2 ? 2 : 1;
+		static const char *comps[] = { "x", "y", "z", "w" };
+		const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
+		const char *encode = get_fp64_encode_name(msl_options.fp64_mode);
+
+		SPIRType slot_type = mtype;
+		slot_type.basetype = SPIRType::UInt;
+		slot_type.width = 32;
+		slot_type.vecsize = 2;
+		slot_type.columns = 1;
+		slot_type.array.clear();
+		slot_type.array_size_literal.clear();
+		slot_type.parent_type = 0;
+		slot_type.op = OpTypeVector;
+		uint32_t slot_type_id = ir.increase_bound_by(1);
+		set<SPIRType>(slot_type_id, slot_type);
+
+		if (location == UINT32_MAX)
+		{
+			if (has_member_decoration(var_type.self, mbr_idx, DecorationLocation))
+				location = get_member_decoration(var_type.self, mbr_idx, DecorationLocation);
+			else if (has_decoration(var.self, DecorationLocation))
+				location = get_accumulated_member_location(var, mbr_idx, meta.strip_array);
+		}
+
+		string base_name = ensure_valid_name(append_member_name(mbr_name_qual, var_type, mbr_idx), "m");
+		uint32_t component = get_member_decoration(var_type.self, mbr_idx, DecorationComponent);
+		uint32_t elems = mtype.array.empty() ? 1 : to_array_size_literal(mtype);
+
+		for (uint32_t e = 0; e < elems; e++)
+		for (uint32_t col = 0; col < cols; col++)
+			for (uint32_t row = 0; row < rows; row++)
+			{
+				uint32_t idx = uint32_t(ib_type.member_types.size());
+				string name = join(base_name, "_", (e * cols + col) * rows + row);
+				string var_chain = var_chain_qual + "." + to_member_name(var_type, mbr_idx) +
+				                   (mtype.array.empty() ? string() : join("[", e, "]"));
+
+				ib_type.member_types.push_back(slot_type_id);
+				set_member_name(ib_type.self, idx, name);
+
+				if (location != UINT32_MAX)
+				{
+					uint32_t locn = location + (e * cols + col) * col_locs + row / 2;
+					uint32_t comp = component + (row % 2) * 2;
+
+					set_member_decoration(ib_type.self, idx, DecorationLocation, locn);
+					if (comp)
+						set_member_decoration(ib_type.self, idx, DecorationComponent, comp);
+					mark_location_as_used_by_shader(locn, slot_type, storage);
+				}
+
+				set_member_decoration(ib_type.self, idx, DecorationFlat);
+				set_extended_member_decoration(ib_type.self, idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
+				set_extended_member_decoration(ib_type.self, idx, SPIRVCrossDecorationInterfaceMemberIndex, var_mbr_idx);
+
+				string local = cols > 1 ? join(".c", col, ".", comps[row]) : rows > 1 ? join(".", comps[row]) : string();
+
+				if (storage == StorageClassInput)
+					entry_func.fixup_hooks_in.push_back([=]() {
+						statement(var_chain, local, " = ", decode, "(", ib_var_ref, ".", name, ");");
+					});
+				else
+					entry_func.fixup_hooks_out.push_back([=]() {
+						statement(ib_var_ref, ".", name, " = ", encode, "(", var_chain, local, ");");
+					});
+			}
+
+		if (location != UINT32_MAX)
+			location += elems * cols * col_locs;
+
+		return;
+	}
 	bool is_flat =
 	    has_member_decoration(var_type.self, mbr_idx, DecorationFlat) || has_decoration(var.self, DecorationFlat);
 	bool is_noperspective = has_member_decoration(var_type.self, mbr_idx, DecorationNoPerspective) ||
@@ -5811,8 +5938,29 @@ std::string CompilerMSL::fp64_decode_expression(const SPIRType &type, const SPIR
 {
 	const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
 
+	// an array decodes element by element
+	if (!type.array.empty())
+	{
+		const SPIRType &elem = get<SPIRType>(type.parent_type);
+		uint32_t n = to_array_size_literal(type);
+		std::string result = type_to_glsl(type) + "{";
+		SPIRType physical_elem = physical_type;
+
+		if (!physical_elem.array.empty())
+		{
+			physical_elem.array.pop_back();
+			physical_elem.array_size_literal.pop_back();
+		}
+
+		for (uint32_t i = 0; i < n; i++)
+			result += join(i ? ", " : "",
+			               fp64_decode_expression(elem, physical_elem, join(enclose_expression(expr_str), "[", i, "]")));
+
+		return result + "}";
+	}
+
 	if (type.vecsize == 1 && type.columns == 1)
-		return join(decode, "(", expr_str, ")");
+		return join(decode, "(", enclose_expression(expr_str), physical_type.vecsize == 4 ? ".xy" : "", ")");
 
 	(void)physical_type;
 
@@ -5938,13 +6086,34 @@ void CompilerMSL::fp64_emit_encode_store(const std::string &lhs, const SPIRType 
 {
 	const char *encode = get_fp64_encode_name(msl_options.fp64_mode);
 
-	if (type.vecsize == 1 && type.columns == 1)
+	// an array stores element by element, from one evaluation of the value
+	if (!type.array.empty())
 	{
-		statement(lhs, " = ", encode, "(", rhs, ");");
+		const SPIRType &elem = get<SPIRType>(type.parent_type);
+		std::string tmp = join("_", ir.increase_bound_by(1), "_fp64_store");
+		SPIRType physical_elem = physical_type ? *physical_type : elem;
+
+		if (physical_type && !physical_elem.array.empty())
+		{
+			physical_elem.array.pop_back();
+			physical_elem.array_size_literal.pop_back();
+		}
+
+		statement("auto ", tmp, " = ", rhs, ";");
+
+		for (uint32_t i = 0; i < to_array_size_literal(type); i++)
+			fp64_emit_encode_store(join(enclose_expression(lhs), "[", i, "]"), elem,
+			                       physical_type ? &physical_elem : nullptr, join(tmp, "[", i, "]"));
 		return;
 	}
 
-	(void)physical_type;
+	if (type.vecsize == 1 && type.columns == 1)
+	{
+		bool padded = physical_type && physical_type->vecsize == 4;
+
+		statement(padded ? enclose_expression(lhs) + ".xy" : lhs, " = ", encode, "(", rhs, ");");
+		return;
+	}
 
 	// The value is written more than once, so evaluate it once first.
 	std::string tmp = join("_", ir.increase_bound_by(1), "_fp64_store");
@@ -6306,7 +6475,8 @@ string CompilerMSL::unpack_expression_type(string expr_str, const SPIRType &type
 	// An emulated double is stored as its raw binary64 bits; turn them back
 	// into the float form the arithmetic works on.
 	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double &&
-	    physical_type && physical_type->basetype == SPIRType::UInt && physical_type->vecsize == 2)
+	    physical_type && physical_type->basetype == SPIRType::UInt &&
+	    (physical_type->vecsize == 2 || physical_type->vecsize == 4))
 	{
 		return fp64_decode_expression(type, *physical_type, expr_str);
 	}
@@ -16809,6 +16979,28 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 	}
 }
 
+// MGL: a texture or sampler array of arrays is declared flat, so its indices
+// are folded into one.
+bool CompilerMSL::flatten_array_access(uint32_t base)
+{
+	auto *var = maybe_get_backing_variable(base);
+
+	if (var == nullptr)
+		return false;
+
+	auto &type = get_variable_data_type(*var);
+	const SPIRType *elem = &type;
+
+	if (type.array.size() < 2)
+		return false;
+
+	while (!elem->array.empty())
+		elem = &get<SPIRType>(elem->parent_type);
+
+	return elem->basetype == SPIRType::Image || elem->basetype == SPIRType::SampledImage ||
+	       elem->basetype == SPIRType::Sampler;
+}
+
 // Returns a string containing a comma-delimited list of args for the entry point function
 // This is the "classic" method of MSL 1 when we don't have argument buffer support.
 string CompilerMSL::entry_point_args_classic(bool append_comma)
@@ -18782,9 +18974,21 @@ std::string CompilerMSL::sampler_type(const SPIRType &type, uint32_t id, bool me
 		if (!msl_options.supports_msl_version(2))
 			SPIRV_CROSS_THROW("MSL 2.0 or greater is required for arrays of samplers.");
 
+		// MGL: Metal takes only one level of array here, so an array of
+		// arrays is declared flat and indexed flat (see
+		// flatten_array_access)
 		if (type.array.size() > 1)
-			SPIRV_CROSS_THROW("Arrays of arrays of samplers are not supported in MSL.");
+		{
+			const SPIRType *elem = &type;
+			uint32_t total = 1;
 
+			for (uint32_t i = 0; i < uint32_t(type.array.size()); i++)
+				total *= to_array_size_literal(type, i);
+			while (!elem->array.empty())
+				elem = &get<SPIRType>(elem->parent_type);
+
+			return join("array<", sampler_type(*elem, id, false), ", ", total, ">");
+		}
 		// Arrays of samplers in MSL must be declared with a special array<T, N> syntax ala C++11 std::array.
 		// If we have a runtime array, it could be a variable-count descriptor set binding.
 		auto &parent = get<SPIRType>(get_pointee_type(type).parent_type);
@@ -18837,9 +19041,19 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 				SPIRV_CROSS_THROW("MSL 2.0 or greater is required for arrays of textures.");
 		}
 
+		// MGL: as for samplers, an array of arrays is declared flat
 		if (type.array.size() > 1)
-			SPIRV_CROSS_THROW("Arrays of arrays of textures are not supported in MSL.");
+		{
+			const SPIRType *elem = &type;
+			uint32_t total = 1;
 
+			for (uint32_t i = 0; i < uint32_t(type.array.size()); i++)
+				total *= to_array_size_literal(type, i);
+			while (!elem->array.empty())
+				elem = &get<SPIRType>(elem->parent_type);
+
+			return join("array<", image_type_glsl(*elem, id, false), ", ", total, ">");
+		}
 		// Arrays of images in MSL must be declared with a special array<T, N> syntax ala C++11 std::array.
 		// If we have a runtime array, it could be a variable-count descriptor set binding.
 		auto &parent = get<SPIRType>(get_pointee_type(type).parent_type);

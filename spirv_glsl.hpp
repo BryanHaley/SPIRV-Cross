@@ -592,6 +592,9 @@ protected:
 
 	// Allow Metal to use the array<T> template to make arrays a value type
 	virtual std::string type_to_array_glsl(const SPIRType &type, uint32_t variable_id);
+	// MGL: whether an access chain from this base folds its array indices
+	// into one, beyond what flatten_multidimensional_arrays asks for
+	virtual bool flatten_array_access(uint32_t) { return false; }
 	std::string to_array_size(const SPIRType &type, uint32_t index);
 	uint32_t to_array_size_literal(const SPIRType &type, uint32_t index) const;
 	uint32_t to_array_size_literal(const SPIRType &type) const;

@@ -984,6 +984,7 @@ protected:
 
 	std::string image_type_glsl(const SPIRType &type, uint32_t id, bool member) override;
 	std::string sampler_type(const SPIRType &type, uint32_t id, bool member);
+	bool flatten_array_access(uint32_t base) override;
 	std::string builtin_to_glsl(BuiltIn builtin, StorageClass storage) override;
 	std::string to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_t id) override;
 	std::string to_name(uint32_t id, bool allow_alias = true) const override;

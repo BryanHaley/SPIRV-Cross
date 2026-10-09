@@ -10953,6 +10953,9 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
                                            AccessChainFlags flags, AccessChainMeta *meta,
                                            const SPIRType *untyped_data_type)
 {
+	// MGL: the option, or a resource this backend can only declare flat
+	bool flatten_arrays = options.flatten_multidimensional_arrays || flatten_array_access(base);
+
 	string expr;
 
 	bool index_is_literal = (flags & ACCESS_CHAIN_INDEX_IS_LITERAL_BIT) != 0;
@@ -11056,7 +11059,7 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 			// Pointer chains
 			// If we are flattening multidimensional arrays, only create opening bracket on first
 			// array index.
-			if (options.flatten_multidimensional_arrays)
+			if (flatten_arrays)
 			{
 				dimension_flatten = type->array.size() >= 1;
 				pending_array_enclose = dimension_flatten;
@@ -11064,7 +11067,7 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 					expr += "[";
 			}
 
-			if (options.flatten_multidimensional_arrays && dimension_flatten)
+			if (flatten_arrays && dimension_flatten)
 			{
 				// If we are flattening multidimensional arrays, do manual stride computation.
 				if (is_literal)
@@ -11143,7 +11146,7 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 		{
 			// If we are flattening multidimensional arrays, only create opening bracket on first
 			// array index.
-			if (options.flatten_multidimensional_arrays && !pending_array_enclose)
+			if (flatten_arrays && !pending_array_enclose)
 			{
 				dimension_flatten = type->array.size() > 1;
 				pending_array_enclose = dimension_flatten;
@@ -11215,7 +11218,7 @@ string CompilerGLSL::access_chain_internal(uint32_t base, const uint32_t *indice
 				else
 					expr = join("gl_MeshVerticesEXT[", to_expression(index, register_expression_read), "].", expr);
 			}
-			else if (options.flatten_multidimensional_arrays && dimension_flatten)
+			else if (flatten_arrays && dimension_flatten)
 			{
 				// If we are flattening multidimensional arrays, do manual stride computation.
 				auto &parent_type = get<SPIRType>(type->parent_type);
