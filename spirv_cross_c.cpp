@@ -799,10 +799,6 @@ spvc_result spvc_compiler_options_set_uint(spvc_compiler_options options, spvc_c
 	case SPVC_COMPILER_OPTION_MSL_RUNTIME_CLIP_DEPTH:
 		options->msl.runtime_clip_depth = value != 0;
 		break;
-
-	case SPVC_COMPILER_OPTION_MSL_CLIP_CONTROL_BUFFER_INDEX:
-		options->msl.clip_control_buffer_index = value;
-		break;
 #endif
 
 	default:

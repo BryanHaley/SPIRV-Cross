@@ -15113,8 +15113,12 @@ void CompilerMSL::emit_fixup()
 			}
 
 			if (options.vertex.fixup_clipspace && msl_options.runtime_clip_depth)
-				statement("if ((spvClipControl & 1u) == 0u) ", qual_pos_var_name, ".z = (", qual_pos_var_name,
-				          ".z + ", qual_pos_var_name, ".w) * 0.5;       // Adjust clip-space for Metal");
+			{
+				statement("#ifndef SPV_CLIP_ZERO_TO_ONE");
+				statement(qual_pos_var_name, ".z = (", qual_pos_var_name, ".z + ", qual_pos_var_name,
+				          ".w) * 0.5;       // Adjust clip-space for Metal");
+				statement("#endif");
+			}
 			else if (options.vertex.fixup_clipspace)
 				statement(qual_pos_var_name, ".z = (", qual_pos_var_name, ".z + ", qual_pos_var_name,
 						  ".w) * 0.5;       // Adjust clip-space for Metal");
@@ -16387,14 +16391,6 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 			ep_args += ", ";
 		ep_args += join("constant uint& spvEmulatedReversedDepthViewportMask [[buffer(",
 		                msl_options.reversed_depth_viewport_buffer_index, ")]]");
-	}
-
-	if (msl_options.runtime_clip_depth && options.vertex.fixup_clipspace && stage_out_var_id &&
-	    !capture_output_to_buffer && is_vertex_like_shader() && !qual_pos_var_name.empty())
-	{
-		if (!ep_args.empty())
-			ep_args += ", ";
-		ep_args += join("constant uint& spvClipControl [[buffer(", msl_options.clip_control_buffer_index, ")]]");
 	}
 
 	if (capture_output_to_buffer)

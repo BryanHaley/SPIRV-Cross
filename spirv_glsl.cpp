@@ -14909,6 +14909,11 @@ void CompilerGLSL::emit_instruction(const Instruction &instruction)
 		                     (atomic_image && get<SPIRType>(type.image.type).basetype == SPIRType::UInt);
 		const char *op = atomic_image ? "imageAtomicAdd" : "atomicAdd";
 		const char *increment = unsigned_type ? "0u" : "0";
+		auto *backing = maybe_get_backing_variable(ops[2]);
+		// MGL: an atomic_uint is read with atomicCounter(); atomicAdd does not take one
+		if (backing && backing->storage == StorageClassAtomicCounter)
+			emit_op(ops[0], ops[1], join("atomicCounter(", to_atomic_ptr_expression(ops[2]), ")"), false);
+		else
 		emit_op(ops[0], ops[1],
 		        join(op, "(",
 		             to_atomic_ptr_expression(ops[2]), ", ", increment, ")"), false);
