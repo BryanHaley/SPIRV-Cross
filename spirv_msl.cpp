@@ -14502,7 +14502,9 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 			farg_str += join(", int2(", offset_expr, ", 0)");
 			break;
 
+		// a rectangle is a 2D texture to Metal, and takes the same offset
 		case Dim2D:
+		case DimRect:
 			if (offset_type->vecsize > 2)
 				offset_expr = enclose_expression(offset_expr) + ".xy";
 
@@ -14524,7 +14526,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	if (args.component && !args.has_array_offsets)
 	{
 		// If 2D has gather component, ensure it also has an offset arg
-		if (imgtype.image.dim == Dim2D && offset_expr.empty())
+		if ((imgtype.image.dim == Dim2D || imgtype.image.dim == DimRect) && offset_expr.empty())
 			farg_str += ", int2(0)";
 
 		if (!msl_options.swizzle_texture_samples || is_dynamic_img_sampler)
@@ -15110,7 +15112,10 @@ void CompilerMSL::emit_fixup()
 				end_scope();
 			}
 
-			if (options.vertex.fixup_clipspace)
+			if (options.vertex.fixup_clipspace && msl_options.runtime_clip_depth)
+				statement("if ((spvClipControl & 1u) == 0u) ", qual_pos_var_name, ".z = (", qual_pos_var_name,
+				          ".z + ", qual_pos_var_name, ".w) * 0.5;       // Adjust clip-space for Metal");
+			else if (options.vertex.fixup_clipspace)
 				statement(qual_pos_var_name, ".z = (", qual_pos_var_name, ".z + ", qual_pos_var_name,
 						  ".w) * 0.5;       // Adjust clip-space for Metal");
 
@@ -15624,7 +15629,10 @@ string CompilerMSL::member_attribute_qualifier(const SPIRType &type, uint32_t in
 				else
 					quals += "centroid_perspective";
 			}
-			else if (has_member_decoration(type.self, index, DecorationSample))
+			// MGL: a fragment shader forced to run per sample reads each input at
+			// its sample, as GL's sample shading asks
+			else if (has_member_decoration(type.self, index, DecorationSample) ||
+			         (msl_options.force_sample_rate_shading && !is_builtin))
 			{
 				if (!quals.empty())
 					quals += ", ";
@@ -16379,6 +16387,14 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 			ep_args += ", ";
 		ep_args += join("constant uint& spvEmulatedReversedDepthViewportMask [[buffer(",
 		                msl_options.reversed_depth_viewport_buffer_index, ")]]");
+	}
+
+	if (msl_options.runtime_clip_depth && options.vertex.fixup_clipspace && stage_out_var_id &&
+	    !capture_output_to_buffer && is_vertex_like_shader() && !qual_pos_var_name.empty())
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("constant uint& spvClipControl [[buffer(", msl_options.clip_control_buffer_index, ")]]");
 	}
 
 	if (capture_output_to_buffer)

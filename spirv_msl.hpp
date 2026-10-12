@@ -568,6 +568,11 @@ public:
 		// user(cullN) varying for a fragment shader that reads gl_CullDistance.
 		bool cull_distance_varyings = false;
 
+		// MGL: glClipControl's depth mode is read at run time from a uint in
+		// this buffer slot; bit 0 set means clip z already runs from 0 to 1.
+		bool runtime_clip_depth = false;
+		uint32_t clip_control_buffer_index = 20;
+
 		bool is_ios() const
 		{
 			return platform == iOS;

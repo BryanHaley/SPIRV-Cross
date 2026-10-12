@@ -17,6 +17,10 @@ namespace SPIRV_CROSS_NAMESPACE
 // MSL prelude — double-float mode (~46 mantissa bits)
 // ===================================================================
 static const char *prelude_df = R"(
+// Every helper is inlined. Called as a real function, with a thread array
+// passed by reference, the Apple GPU compiler gave wrong low-order parts or
+// dropped the result on some dispatches -- different ones each process.
+#define MGL_INL __attribute__((always_inline)) static inline
 // ⚠ MGL fp64 emulation — double-float mode (~46 mantissa bits)
 // ⚠ This shader must be compiled with mathMode = MTLMathModeSafe
 //    (or fastMathEnabled = NO). Fast math will delete error-recovery
@@ -25,33 +29,33 @@ static const char *prelude_df = R"(
 struct MGLdf { float hi, lo; };
 
 // ---- EFT primitives ----
-static inline MGLdf MGLdf_two_sum(float a, float b) {
+MGL_INL MGLdf MGLdf_two_sum(float a, float b) {
     float s = a + b, bb = s - a;
     return MGLdf{s, (a - (s - bb)) + (b - bb)};
 }
-static inline MGLdf MGLdf_quick_two_sum(float a, float b) {
+MGL_INL MGLdf MGLdf_quick_two_sum(float a, float b) {
     float s = a + b; return MGLdf{s, b - (s - a)};
 }
-static inline MGLdf MGLdf_two_prod(float a, float b) {
+MGL_INL MGLdf MGLdf_two_prod(float a, float b) {
     float p = a * b; return MGLdf{p, fma(a, b, -p)};
 }
 
 // ---- double-float arithmetic ----
-static inline MGLdf MGLdf_add(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_add(MGLdf a, MGLdf b) {
     MGLdf s = MGLdf_two_sum(a.hi, b.hi), t = MGLdf_two_sum(a.lo, b.lo);
     s.lo += t.hi; s = MGLdf_quick_two_sum(s.hi, s.lo);
     s.lo += t.lo; return MGLdf_quick_two_sum(s.hi, s.lo);
 }
-static inline MGLdf MGLdf_sub(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_sub(MGLdf a, MGLdf b) {
     return MGLdf_add(a, MGLdf{-b.hi, -b.lo});
 }
-static inline MGLdf MGLdf_mul(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_mul(MGLdf a, MGLdf b) {
     MGLdf p = MGLdf_two_prod(a.hi, b.hi);
     p.lo += a.hi * b.lo + a.lo * b.hi;
     return MGLdf_quick_two_sum(p.hi, p.lo);
 }
 // Division: 1 NR iteration. float seed ~24 bits, one df NR -> ~48 bits (>46).
-static inline MGLdf MGLdf_div(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_div(MGLdf a, MGLdf b) {
     float r = 1.0f / b.hi;
     MGLdf x = MGLdf{r, 0.0f};
     MGLdf two = MGLdf{2.0f, 0.0f};
@@ -59,7 +63,7 @@ static inline MGLdf MGLdf_div(MGLdf a, MGLdf b) {
     return MGLdf_mul(a, x);
 }
 // Sqrt: 1 NR iteration on rsqrt.
-static inline MGLdf MGLdf_sqrt(MGLdf a) {
+MGL_INL MGLdf MGLdf_sqrt(MGLdf a) {
     float y = rsqrt(a.hi);
     MGLdf yn = MGLdf{y, 0.0f};
     MGLdf half_ = MGLdf{0.5f, 0.0f};
@@ -68,35 +72,35 @@ static inline MGLdf MGLdf_sqrt(MGLdf a) {
     yn = MGLdf_mul(yn, MGLdf_mul(half_, MGLdf_sub(three, MGLdf_mul(a, yn2))));
     return MGLdf_mul(a, yn);
 }
-static inline MGLdf MGLdf_neg(MGLdf a) { return MGLdf{-a.hi, -a.lo}; }
-static inline MGLdf MGLdf_abs(MGLdf a) {
+MGL_INL MGLdf MGLdf_neg(MGLdf a) { return MGLdf{-a.hi, -a.lo}; }
+MGL_INL MGLdf MGLdf_abs(MGLdf a) {
     return MGLdf{fabs(a.hi), (a.hi < 0.0f ? -a.lo : (a.hi > 0.0f ? a.lo : fabs(a.lo)))};
 }
-static inline MGLdf MGLdf_min(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_min(MGLdf a, MGLdf b) {
     float v = a.hi + a.lo, w = b.hi + b.lo;
     return (v < w) ? a : ((w < v) ? b : ((a.hi < b.hi) ? a : b));
 }
-static inline MGLdf MGLdf_max(MGLdf a, MGLdf b) {
+MGL_INL MGLdf MGLdf_max(MGLdf a, MGLdf b) {
     float v = a.hi + a.lo, w = b.hi + b.lo;
     return (v > w) ? a : ((w > v) ? b : ((a.hi > b.hi) ? a : b));
 }
 
 // ---- double-float comparisons ----
-static inline bool MGLdf_eq (MGLdf a, MGLdf b) { return (a.hi == b.hi) && (a.lo == b.lo); }
-static inline bool MGLdf_ne (MGLdf a, MGLdf b) { return !MGLdf_eq(a, b); }
-static inline bool MGLdf_lt (MGLdf a, MGLdf b) { return (a.hi < b.hi) || (a.hi == b.hi && a.lo < b.lo); }
-static inline bool MGLdf_le (MGLdf a, MGLdf b) { return (a.hi < b.hi) || (a.hi == b.hi && a.lo <= b.lo); }
-static inline bool MGLdf_gt (MGLdf a, MGLdf b) { return MGLdf_lt(b, a); }
-static inline bool MGLdf_ge (MGLdf a, MGLdf b) { return MGLdf_le(b, a); }
+MGL_INL bool MGLdf_eq (MGLdf a, MGLdf b) { return (a.hi == b.hi) && (a.lo == b.lo); }
+MGL_INL bool MGLdf_ne (MGLdf a, MGLdf b) { return !MGLdf_eq(a, b); }
+MGL_INL bool MGLdf_lt (MGLdf a, MGLdf b) { return (a.hi < b.hi) || (a.hi == b.hi && a.lo < b.lo); }
+MGL_INL bool MGLdf_le (MGLdf a, MGLdf b) { return (a.hi < b.hi) || (a.hi == b.hi && a.lo <= b.lo); }
+MGL_INL bool MGLdf_gt (MGLdf a, MGLdf b) { return MGLdf_lt(b, a); }
+MGL_INL bool MGLdf_ge (MGLdf a, MGLdf b) { return MGLdf_le(b, a); }
 
 // ---- Conversions ----
-static inline MGLdf MGLdf_from_float(float a) { return MGLdf{a, 0.0f}; }
-static inline float MGLdf_to_float(MGLdf a) { return a.hi + a.lo; }
-static inline MGLdf MGLdf_from_int(int a) { float f = float(a); return MGLdf{f, float(a) - f}; }
-static inline int    MGLdf_to_int(MGLdf a)   { return int(a.hi + a.lo); }
-static inline MGLdf MGLdf_from_uint(uint a) { float f = float(a); return MGLdf{f, float(a) - f}; }
-static inline uint   MGLdf_to_uint(MGLdf a)  { return uint(a.hi + a.lo); }
-static inline MGLdf MGLdf_sign(MGLdf a) {
+MGL_INL MGLdf MGLdf_from_float(float a) { return MGLdf{a, 0.0f}; }
+MGL_INL float MGLdf_to_float(MGLdf a) { return a.hi + a.lo; }
+MGL_INL MGLdf MGLdf_from_int(int a) { float f = float(a); return MGLdf{f, float(a) - f}; }
+MGL_INL int    MGLdf_to_int(MGLdf a)   { return int(a.hi + a.lo); }
+MGL_INL MGLdf MGLdf_from_uint(uint a) { float f = float(a); return MGLdf{f, float(a) - f}; }
+MGL_INL uint   MGLdf_to_uint(MGLdf a)  { return uint(a.hi + a.lo); }
+MGL_INL MGLdf MGLdf_sign(MGLdf a) {
     float s = a.hi + a.lo;
     if (s > 0.0f) return MGLdf{1.0f, 0.0f};
     if (s < 0.0f) return MGLdf{-1.0f, 0.0f};
@@ -104,15 +108,15 @@ static inline MGLdf MGLdf_sign(MGLdf a) {
 }
 
 // ---- Rounding ----
-static inline MGLdf MGLdf_floor(MGLdf a)     { float f = floor(a.hi + a.lo); return MGLdf{f, 0.0f}; }
-static inline MGLdf MGLdf_ceil(MGLdf a)      { float f = ceil(a.hi + a.lo);  return MGLdf{f, 0.0f}; }
-static inline MGLdf MGLdf_trunc(MGLdf a)     { float f = trunc(a.hi + a.lo); return MGLdf{f, 0.0f}; }
-static inline MGLdf MGLdf_round(MGLdf a)     { float f = round(a.hi + a.lo); return MGLdf{f, 0.0f}; }
-static inline MGLdf MGLdf_roundeven(MGLdf a) { float f = rint(a.hi + a.lo);  return MGLdf{f, 0.0f}; }
+MGL_INL MGLdf MGLdf_floor(MGLdf a)     { float f = floor(a.hi + a.lo); return MGLdf{f, 0.0f}; }
+MGL_INL MGLdf MGLdf_ceil(MGLdf a)      { float f = ceil(a.hi + a.lo);  return MGLdf{f, 0.0f}; }
+MGL_INL MGLdf MGLdf_trunc(MGLdf a)     { float f = trunc(a.hi + a.lo); return MGLdf{f, 0.0f}; }
+MGL_INL MGLdf MGLdf_round(MGLdf a)     { float f = round(a.hi + a.lo); return MGLdf{f, 0.0f}; }
+MGL_INL MGLdf MGLdf_roundeven(MGLdf a) { float f = rint(a.hi + a.lo);  return MGLdf{f, 0.0f}; }
 
 // ---- Decode / Encode (IEEE binary64 <-> MGLdf) ----
 // low word = bits.x, high word = bits.y
-static inline MGLdf MGLdf_decode(uint2 bits) {
+MGL_INL MGLdf MGLdf_decode(uint2 bits) {
     // Two floats reach about 46 bits, so the bottom 8 mantissa bits of a
     // binary64 do not survive. That is the cost of the fast mode.
     uint hi = bits.y, lo = bits.x;
@@ -133,7 +137,7 @@ static inline MGLdf MGLdf_decode(uint2 bits) {
     r.lo = sgn * ldexp(rest, e - 44);
     return r;
 }
-static inline uint2 MGLdf_encode(MGLdf v) {
+MGL_INL uint2 MGLdf_encode(MGLdf v) {
     float s0 = v.hi + v.lo;
     if (s0 == 0.0f) return uint2(0u, 0u);
     if (isinf(s0))  return uint2(0u, (s0 < 0.0f) ? 0xFFF00000u : 0x7FF00000u);
@@ -186,6 +190,10 @@ static inline uint2 MGLdf_encode(MGLdf v) {
 // MSL prelude — triple-float mode (~72.8 mantissa bits, default)
 // ===================================================================
 static const char *prelude_tf = R"(
+// Every helper is inlined. Called as a real function, with a thread array
+// passed by reference, the Apple GPU compiler gave wrong low-order parts or
+// dropped the result on some dispatches -- different ones each process.
+#define MGL_INL __attribute__((always_inline)) static inline
 // ⚠ MGL fp64 emulation — triple-float mode (~72.8 mantissa bits)
 // ⚠ This shader must be compiled with mathMode = MTLMathModeSafe
 //    (or fastMathEnabled = NO). Fast math will delete error-recovery
@@ -195,55 +203,66 @@ struct MGLdf { float hi, lo; };
 struct MGLtf { float x, y, z; };  // value == x + y + z, non-overlapping
 
 // ---- EFT primitives (Dekker / Knuth) ----
-static inline MGLdf MGLdf_two_sum(float a, float b) {
+MGL_INL MGLdf MGLdf_two_sum(float a, float b) {
     float s = a + b, bb = s - a;
     return MGLdf{s, (a - (s - bb)) + (b - bb)};
 }
-static inline MGLdf MGLdf_quick_two_sum(float a, float b) {
+MGL_INL MGLdf MGLdf_quick_two_sum(float a, float b) {
     float s = a + b; return MGLdf{s, b - (s - a)};
 }
-static inline MGLdf MGLdf_two_prod(float a, float b) {
+MGL_INL MGLdf MGLdf_two_prod(float a, float b) {
     float p = a * b; return MGLdf{p, fma(a, b, -p)};
 }
 
 // ---- Priest-style renormalisation ----
 // IMPORTANT: input terms MUST be in descending magnitude order.
-template <int N> static inline MGLtf MGLtf_renorm(thread float (&e)[N]) {
+template <int N> MGL_INL MGLtf MGLtf_renorm(thread float (&e)[N]) {
+    // unrolled, so every index is a constant and e stays in registers;
+    // a counted index puts the array in per-thread memory
+#pragma unroll
     for (int i = N - 1; i > 0; i--) { MGLdf s = MGLdf_two_sum(e[i - 1], e[i]); e[i - 1] = s.hi; e[i] = s.lo; }
+#pragma unroll
     for (int i = N - 1; i > 1; i--) { MGLdf s = MGLdf_two_sum(e[i - 1], e[i]); e[i - 1] = s.hi; e[i] = s.lo; }
+#pragma unroll
     for (int i = N - 1; i > 2; i--) { MGLdf s = MGLdf_two_sum(e[i - 1], e[i]); e[i - 1] = s.hi; e[i] = s.lo; }
     float t = 0.0f;
+#pragma unroll
     for (int i = 3; i < N; i++) t += e[i];
     return MGLtf{e[0], e[1], e[2] + t};
 }
 
 // ---- triple-float arithmetic ----
-static inline MGLtf MGLtf_canon(MGLtf v) {
+MGL_INL MGLtf MGLtf_canon(MGLtf v) {
     float e[3] = {v.x, v.y, v.z};
     return MGLtf_renorm(e);
 }
-static inline MGLtf MGLtf_add(MGLtf a_in, MGLtf b_in) {
+MGL_INL MGLtf MGLtf_add(MGLtf a_in, MGLtf b_in) {
     // Merge two already-descending triples into one descending six. The old
     // interleave {a.x,b.x,a.y,b.y,a.z,b.z} is only in order when a and b are
     // the same size; when they are not, the renormalisation loses the tail.
     // Both must be non-overlapping first; a freshly decoded double is not.
     MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
-    float A[3] = {a.x, a.y, a.z};
-    float B[3] = {b.x, b.y, b.z};
+    // Plain variables and selects only. An array indexed by a counter lives in
+    // per-thread memory, and the merge read from it went wrong now and then.
+    float ah = a.x, am = a.y, al = a.z, bh = b.x, bm = b.y, bl = b.z;
+    int na = 3, nb = 3;
     float e[6];
-    int i = 0, j = 0;
+#pragma unroll
     for (int k = 0; k < 6; k++) {
-        bool takeA = (j >= 3) || (i < 3 && fabs(A[i]) >= fabs(B[j]));
-        e[k] = takeA ? A[i] : B[j];
-        i += takeA ? 1 : 0;
-        j += takeA ? 0 : 1;
+        bool takeA = (nb == 0) || (na > 0 && fabs(ah) >= fabs(bh));
+        e[k] = takeA ? ah : bh;
+        // shift the taken triple up by one; an empty slot reads zero
+        ah = takeA ? am : ah; am = takeA ? al : am; al = takeA ? 0.0f : al;
+        bh = takeA ? bh : bm; bm = takeA ? bm : bl; bl = takeA ? bl : 0.0f;
+        na -= takeA ? 1 : 0;
+        nb -= takeA ? 0 : 1;
     }
     return MGLtf_renorm(e);
 }
-static inline MGLtf MGLtf_sub(MGLtf a, MGLtf b) {
+MGL_INL MGLtf MGLtf_sub(MGLtf a, MGLtf b) {
     return MGLtf_add(a, MGLtf{-b.x, -b.y, -b.z});
 }
-static inline MGLtf MGLtf_mul(MGLtf a_in, MGLtf b_in) {
+MGL_INL MGLtf MGLtf_mul(MGLtf a_in, MGLtf b_in) {
     // The 13-term ordering below assumes each component is about 2^-24 of the
     // one before it. A decoded double is not in that form until it is renormalised.
     MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
@@ -258,7 +277,7 @@ static inline MGLtf MGLtf_mul(MGLtf a_in, MGLtf b_in) {
     return MGLtf_renorm(e);
 }
 // Division: 2 NR iterations. float seed ~24 bits -> 1st NR ~48 bits -> 2nd NR ~96 bits (>72.8).
-static inline MGLtf MGLtf_div(MGLtf a, MGLtf b) {
+MGL_INL MGLtf MGLtf_div(MGLtf a, MGLtf b) {
     float r = 1.0f / b.x;
     MGLtf x = MGLtf{r, 0.0f, 0.0f};
     MGLtf two = MGLtf{2.0f, 0.0f, 0.0f};
@@ -267,7 +286,7 @@ static inline MGLtf MGLtf_div(MGLtf a, MGLtf b) {
     return MGLtf_mul(a, x);
 }
 // Sqrt: 2 NR iterations on rsqrt.
-static inline MGLtf MGLtf_sqrt(MGLtf a) {
+MGL_INL MGLtf MGLtf_sqrt(MGLtf a) {
     float y = rsqrt(a.x);
     MGLtf yn = MGLtf{y, 0.0f, 0.0f};
     MGLtf half_ = MGLtf{0.5f, 0.0f, 0.0f};
@@ -278,20 +297,20 @@ static inline MGLtf MGLtf_sqrt(MGLtf a) {
     yn = MGLtf_mul(yn, MGLtf_mul(half_, MGLtf_sub(three, MGLtf_mul(a, yn2))));
     return MGLtf_mul(a, yn);
 }
-static inline MGLtf MGLtf_neg(MGLtf a) { return MGLtf{-a.x, -a.y, -a.z}; }
-static inline MGLtf MGLtf_abs(MGLtf a) {
+MGL_INL MGLtf MGLtf_neg(MGLtf a) { return MGLtf{-a.x, -a.y, -a.z}; }
+MGL_INL MGLtf MGLtf_abs(MGLtf a) {
     return MGLtf{fabs(a.x),
                  (a.x < 0.0f ? -a.y : (a.x > 0.0f ? a.y : fabs(a.y))),
                  (a.x < 0.0f ? -a.z : (a.x > 0.0f ? a.z : ((a.y < 0.0f) ? -a.z : fabs(a.z))))};
 }
-static inline MGLtf MGLtf_min(MGLtf a, MGLtf b) {
+MGL_INL MGLtf MGLtf_min(MGLtf a, MGLtf b) {
     float va = a.x + a.y + a.z, vb = b.x + b.y + b.z;
     if (va < vb) return a; if (vb < va) return b;
     if (a.x < b.x) return a; if (b.x < a.x) return b;
     if (a.y < b.y) return a; if (b.y < a.y) return b;
     return (a.z < b.z) ? a : b;
 }
-static inline MGLtf MGLtf_max(MGLtf a, MGLtf b) {
+MGL_INL MGLtf MGLtf_max(MGLtf a, MGLtf b) {
     float va = a.x + a.y + a.z, vb = b.x + b.y + b.z;
     if (va > vb) return a; if (vb > va) return b;
     if (a.x > b.x) return a; if (b.x > a.x) return b;
@@ -304,47 +323,47 @@ static inline MGLtf MGLtf_max(MGLtf a, MGLtf b) {
 // from its bits is split differently from the same double written as a
 // literal -- so both sides are put in the one non-overlapping form before
 // their parts are compared.
-static inline bool MGLtf_eq(MGLtf a_in, MGLtf b_in) {
+MGL_INL bool MGLtf_eq(MGLtf a_in, MGLtf b_in) {
     // an infinity or NaN is all in the top part, and canon would turn the
     // rest into NaN
     if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x == b_in.x;
     MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
     return (a.x == b.x) && (a.y == b.y) && (a.z == b.z);
 }
-static inline bool MGLtf_ne(MGLtf a, MGLtf b) { return !MGLtf_eq(a, b); }
-static inline bool MGLtf_lt(MGLtf a_in, MGLtf b_in) {
+MGL_INL bool MGLtf_ne(MGLtf a, MGLtf b) { return !MGLtf_eq(a, b); }
+MGL_INL bool MGLtf_lt(MGLtf a_in, MGLtf b_in) {
     if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x < b_in.x;
     MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
     if (a.x != b.x) return a.x < b.x;
     if (a.y != b.y) return a.y < b.y;
     return a.z < b.z;
 }
-static inline bool MGLtf_le(MGLtf a_in, MGLtf b_in) {
+MGL_INL bool MGLtf_le(MGLtf a_in, MGLtf b_in) {
     if (!isfinite(a_in.x) || !isfinite(b_in.x)) return a_in.x <= b_in.x;
     MGLtf a = MGLtf_canon(a_in), b = MGLtf_canon(b_in);
     if (a.x != b.x) return a.x < b.x;
     if (a.y != b.y) return a.y < b.y;
     return a.z <= b.z;
 }
-static inline bool MGLtf_gt(MGLtf a, MGLtf b) { return MGLtf_lt(b, a); }
-static inline bool MGLtf_ge(MGLtf a, MGLtf b) { return MGLtf_le(b, a); }
+MGL_INL bool MGLtf_gt(MGLtf a, MGLtf b) { return MGLtf_lt(b, a); }
+MGL_INL bool MGLtf_ge(MGLtf a, MGLtf b) { return MGLtf_le(b, a); }
 
 // ---- Conversions ----
-static inline MGLtf MGLtf_from_float(float a) { return MGLtf{a, 0.0f, 0.0f}; }
-static inline float MGLtf_to_float(MGLtf a) { return a.x + a.y + a.z; }
-static inline MGLtf MGLtf_from_int(int a) {
+MGL_INL MGLtf MGLtf_from_float(float a) { return MGLtf{a, 0.0f, 0.0f}; }
+MGL_INL float MGLtf_to_float(MGLtf a) { return a.x + a.y + a.z; }
+MGL_INL MGLtf MGLtf_from_int(int a) {
     float f = float(a);
     MGLdf r = MGLdf_two_sum(f, float(a) - f);
     return MGLtf{r.hi, r.lo, 0.0f};
 }
-static inline int MGLtf_to_int(MGLtf a) { return int(a.x + a.y + a.z); }
-static inline MGLtf MGLtf_from_uint(uint a) {
+MGL_INL int MGLtf_to_int(MGLtf a) { return int(a.x + a.y + a.z); }
+MGL_INL MGLtf MGLtf_from_uint(uint a) {
     float f = float(a);
     MGLdf r = MGLdf_two_sum(f, float(a) - f);
     return MGLtf{r.hi, r.lo, 0.0f};
 }
-static inline uint MGLtf_to_uint(MGLtf a) { return uint(a.x + a.y + a.z); }
-static inline MGLtf MGLtf_sign(MGLtf a) {
+MGL_INL uint MGLtf_to_uint(MGLtf a) { return uint(a.x + a.y + a.z); }
+MGL_INL MGLtf MGLtf_sign(MGLtf a) {
     float s = a.x + a.y + a.z;
     if (s > 0.0f) return MGLtf{1.0f, 0.0f, 0.0f};
     if (s < 0.0f) return MGLtf{-1.0f, 0.0f, 0.0f};
@@ -352,14 +371,14 @@ static inline MGLtf MGLtf_sign(MGLtf a) {
 }
 
 // ---- Rounding ----
-static inline MGLtf MGLtf_floor(MGLtf a)     { float f = floor(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
-static inline MGLtf MGLtf_ceil(MGLtf a)      { float f = ceil(a.x + a.y + a.z);  return MGLtf{f, 0.0f, 0.0f}; }
-static inline MGLtf MGLtf_trunc(MGLtf a)     { float f = trunc(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
-static inline MGLtf MGLtf_round(MGLtf a)     { float f = round(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
-static inline MGLtf MGLtf_roundeven(MGLtf a) { float f = rint(a.x + a.y + a.z);  return MGLtf{f, 0.0f, 0.0f}; }
+MGL_INL MGLtf MGLtf_floor(MGLtf a)     { float f = floor(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
+MGL_INL MGLtf MGLtf_ceil(MGLtf a)      { float f = ceil(a.x + a.y + a.z);  return MGLtf{f, 0.0f, 0.0f}; }
+MGL_INL MGLtf MGLtf_trunc(MGLtf a)     { float f = trunc(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
+MGL_INL MGLtf MGLtf_round(MGLtf a)     { float f = round(a.x + a.y + a.z); return MGLtf{f, 0.0f, 0.0f}; }
+MGL_INL MGLtf MGLtf_roundeven(MGLtf a) { float f = rint(a.x + a.y + a.z);  return MGLtf{f, 0.0f, 0.0f}; }
 
 // ---- Decode / Encode (IEEE binary64 <-> MGLtf) ----
-static inline MGLtf MGLtf_decode(uint2 bits) {
+MGL_INL MGLtf MGLtf_decode(uint2 bits) {
     // binary64 has 52 stored mantissa bits; a float holds 24 exactly. Split the
     // mantissa into 21 + 16 + 16 bit pieces so every conversion below is exact
     // and the three floats end up non-overlapping without any renormalisation.
@@ -387,7 +406,7 @@ static inline MGLtf MGLtf_decode(uint2 bits) {
     MGLtf r; r.x = e3[0]; r.y = e3[1]; r.z = e3[2];
     return r;
 }
-static inline uint2 MGLtf_encode(MGLtf v) {
+MGL_INL uint2 MGLtf_encode(MGLtf v) {
     // Peel the mantissa back out in 20 + 16 + 16 bit pieces. Every scaling here
     // is by a power of two and every floor lands on a value under 2^20, so the
     // only rounding is the deliberate one at the end.
@@ -548,56 +567,56 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 
 	// ---- scalar operations the fixed prelude does not carry ----
 	e.line("// ---- Scalar operations built on the primitives above ----");
-	e.line("static inline " + P + " " + P + "_fract(" + P + " a) { return " + e.sub("a", e.call("floor", "a")) +
+	e.line("MGL_INL " + P + " " + P + "_fract(" + P + " a) { return " + e.sub("a", e.call("floor", "a")) +
 	       "; }");
-	e.line("static inline " + P + " " + P + "_mod(" + P + " a, " + P + " b) { return " +
+	e.line("MGL_INL " + P + " " + P + "_mod(" + P + " a, " + P + " b) { return " +
 	       e.sub("a", e.mul("b", e.call("floor", e.div("a", "b")))) + "; }");
 	// GLSL's mod floors; C's fmod truncates. SPIR-V has an opcode for each.
-	e.line("static inline " + P + " " + P + "_rem(" + P + " a, " + P + " b) { return " +
+	e.line("MGL_INL " + P + " " + P + "_rem(" + P + " a, " + P + " b) { return " +
 	       e.sub("a", e.mul("b", e.call("trunc", e.div("a", "b")))) + "; }");
-	e.line("static inline " + P + " " + P + "_inversesqrt(" + P + " a) { return " +
+	e.line("MGL_INL " + P + " " + P + "_inversesqrt(" + P + " a) { return " +
 	       e.div(e.lit(1.0f), e.call("sqrt", "a")) + "; }");
-	e.line("static inline " + P + " " + P + "_mix(" + P + " a, " + P + " b, " + P + " t) { return " +
+	e.line("MGL_INL " + P + " " + P + "_mix(" + P + " a, " + P + " b, " + P + " t) { return " +
 	       e.add("a", e.mul(e.sub("b", "a"), "t")) + "; }");
-	e.line("static inline " + P + " " + P + "_clamp(" + P + " a, " + P + " lo, " + P + " hi) { return " +
+	e.line("MGL_INL " + P + " " + P + "_clamp(" + P + " a, " + P + " lo, " + P + " hi) { return " +
 	       e.call("min", e.call("max", "a", "lo"), "hi") + "; }");
-	e.line("static inline " + P + " " + P + "_step(" + P + " edge, " + P + " a) { return " + P +
+	e.line("MGL_INL " + P + " " + P + "_step(" + P + " edge, " + P + " a) { return " + P +
 	       "_lt(a, edge) ? " + e.lit(0.0f) + " : " + e.lit(1.0f) + "; }");
-	e.line("static inline " + P + " " + P + "_smoothstep(" + P + " e0, " + P + " e1, " + P + " a) {");
+	e.line("MGL_INL " + P + " " + P + "_smoothstep(" + P + " e0, " + P + " e1, " + P + " a) {");
 	e.line("    " + P + " t = " + e.call("clamp", e.div(e.sub("a", "e0"), e.sub("e1", "e0")), e.lit(0.0f),
 	                                     e.lit(1.0f)) + ";");
 	e.line("    return " + e.mul(e.mul("t", "t"), e.sub(e.lit(3.0f), e.mul(e.lit(2.0f), "t"))) + "; }");
-	e.line("static inline " + P + " " + P + "_fma(" + P + " a, " + P + " b, " + P + " c) { return " +
+	e.line("MGL_INL " + P + " " + P + "_fma(" + P + " a, " + P + " b, " + P + " c) { return " +
 	       e.add(e.mul("a", "b"), "c") + "; }");
 	// A value is the sum of its terms, so the leading term decides these.
-	e.line("static inline bool " + P + "_isnan(" + P + " a) { return isnan(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
-	e.line("static inline bool " + P + "_isinf(" + P + " a) { return isinf(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
+	e.line("MGL_INL bool " + P + "_isnan(" + P + " a) { return isnan(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
+	e.line("MGL_INL bool " + P + "_isinf(" + P + " a) { return isinf(" + (mode == FP64Mode::TripleFloat ? "a.x" : "a.hi") + "); }");
 	if (mode == FP64Mode::TripleFloat)
 	{
-		e.line("static inline " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
+		e.line("MGL_INL " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
 		       "_canon(" + P + "{ldexp(a.x, n), ldexp(a.y, n), ldexp(a.z, n)}); }");
-		e.line("static inline " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
+		e.line("MGL_INL " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
 		e.line("    if (a.x == 0.0f) { n = 0; return a; }");
 		e.line("    n = ilogb(a.x) + 1;");
 		e.line("    return " + P + "_ldexp(a, -n); }");
 	}
 	else
 	{
-		e.line("static inline " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
+		e.line("MGL_INL " + P + " " + P + "_ldexp(" + P + " a, int n) { return " + P +
 		       "{ldexp(a.hi, n), ldexp(a.lo, n)}; }");
-		e.line("static inline " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
+		e.line("MGL_INL " + P + " " + P + "_frexp(" + P + " a, thread int &n) {");
 		e.line("    if (a.hi == 0.0f) { n = 0; return a; }");
 		e.line("    n = ilogb(a.hi) + 1;");
 		e.line("    return " + P + "_ldexp(a, -n); }");
 	}
-	e.line("static inline " + P + " " + P + "_modf(" + P + " a, thread " + P + " &ip) {");
+	e.line("MGL_INL " + P + " " + P + "_modf(" + P + " a, thread " + P + " &ip) {");
 	e.line("    ip = " + e.call("trunc", "a") + "; return " + e.sub("a", "ip") + "; }");
 	// The unordered forms are true whenever either side is a NaN. Unordered
 	// not-equal needs no wrapper: not-equal already answers true there.
 	for (const char *c : { "eq", "lt", "le", "gt", "ge" })
-		e.line("static inline bool " + P + "_un_" + c + "(" + P + " a, " + P + " b) { return " + P +
+		e.line("MGL_INL bool " + P + "_un_" + c + "(" + P + " a, " + P + " b) { return " + P +
 		       "_isnan(a) || " + P + "_isnan(b) || " + P + "_" + c + "(a, b); }");
-	e.line("static inline bool " + P + "_un_ne(" + P + " a, " + P + " b) { return " + P + "_ne(a, b); }");
+	e.line("MGL_INL bool " + P + "_un_ne(" + P + " a, " + P + " b) { return " + P + "_ne(a, b); }");
 	e.line("");
 
 	// Everything above is scalar and a plain double needs it: glslang turns
@@ -652,7 +671,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			std::vector<std::string> parts;
 			for (uint32_t i = 0; i < n; i++)
 				parts.push_back(e.call(u.name, e.at("a", i, n)));
-			e.line("static inline " + V + " " + P + "_" + u.name + "(" + V + " a) { return " + e.build(n, parts) +
+			e.line("MGL_INL " + V + " " + P + "_" + u.name + "(" + V + " a) { return " + e.build(n, parts) +
 			       "; }");
 		}
 
@@ -665,17 +684,17 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				vs.push_back(e.call(b, e.at("a", i, n), "b"));
 				sv.push_back(e.call(b, "a", e.at("b", i, n)));
 			}
-			e.line("static inline " + V + " " + P + "_" + b + "(" + V + " a, " + V + " b) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + b + "(" + V + " a, " + V + " b) { return " +
 			       e.build(n, vv) + "; }");
-			e.line("static inline " + V + " " + P + "_" + b + "(" + V + " a, " + P + " b) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + b + "(" + V + " a, " + P + " b) { return " +
 			       e.build(n, vs) + "; }");
-			e.line("static inline " + V + " " + P + "_" + b + "(" + P + " a, " + V + " b) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + b + "(" + P + " a, " + V + " b) { return " +
 			       e.build(n, sv) + "; }");
 		}
 
 		for (auto *c : compares)
 		{
-			std::string s = "static inline " + B + " " + P + "_" + c + "(" + V + " a, " + V + " b) { return " + B +
+			std::string s = "MGL_INL " + B + " " + P + "_" + c + "(" + V + " a, " + V + " b) { return " + B +
 			                "(";
 			for (uint32_t i = 0; i < n; i++)
 				s += (i ? ", " : "") + e.call(c, e.at("a", i, n), e.at("b", i, n));
@@ -692,9 +711,9 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				from.push_back(e.call(std::string("from_") + c, e.at("a", i, n)));
 				to += (i ? ", " : "") + e.call(std::string("to_") + c, e.at("a", i, n));
 			}
-			e.line("static inline " + V + " " + P + "_from_" + c + "(" + native + " a) { return " +
+			e.line("MGL_INL " + V + " " + P + "_from_" + c + "(" + native + " a) { return " +
 			       e.build(n, from) + "; }");
-			e.line("static inline " + native + " " + P + "_to_" + c + "(" + V + " a) { return " + to + "); }");
+			e.line("MGL_INL " + native + " " + P + "_to_" + c + "(" + V + " a) { return " + to + "); }");
 		}
 
 		// three-operand builtins, with the scalar-tail forms GLSL also allows
@@ -707,15 +726,15 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				vvv.push_back(e.call(t, e.at("a", i, n), e.at("b", i, n), e.at("c", i, n)));
 				vvs.push_back(e.call(t, e.at("a", i, n), "b", "c"));
 			}
-			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + V + " c) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + V + " c) { return " +
 			       e.build(n, vvv) + "; }");
-			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + P + " b, " + P + " c) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + t + "(" + V + " a, " + P + " b, " + P + " c) { return " +
 			       e.build(n, vvs) + "; }");
 			// mix and smoothstep also take a scalar only in the last operand
 			std::vector<std::string> vvt;
 			for (uint32_t i = 0; i < n; i++)
 				vvt.push_back(e.call(t, e.at("a", i, n), e.at("b", i, n), "c"));
-			e.line("static inline " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + P + " c) { return " +
+			e.line("MGL_INL " + V + " " + P + "_" + t + "(" + V + " a, " + V + " b, " + P + " c) { return " +
 			       e.build(n, vvt) + "; }");
 		}
 
@@ -727,15 +746,15 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				vv.push_back(e.call("step", e.at("edge", i, n), e.at("a", i, n)));
 				sv.push_back(e.call("step", "edge", e.at("a", i, n)));
 			}
-			e.line("static inline " + V + " " + P + "_step(" + V + " edge, " + V + " a) { return " +
+			e.line("MGL_INL " + V + " " + P + "_step(" + V + " edge, " + V + " a) { return " +
 			       e.build(n, vv) + "; }");
-			e.line("static inline " + V + " " + P + "_step(" + P + " edge, " + V + " a) { return " +
+			e.line("MGL_INL " + V + " " + P + "_step(" + P + " edge, " + V + " a) { return " +
 			       e.build(n, sv) + "; }");
 		}
 
 		// select on a boolean vector, which is how GLSL's mix(a, b, bvec) arrives
 		{
-			std::string s = "static inline " + V + " " + P + "_select(" + V + " a, " + V + " b, " + B +
+			std::string s = "MGL_INL " + V + " " + P + "_select(" + V + " a, " + V + " b, " + B +
 			                " t) { return " + V + "{";
 			for (uint32_t i = 0; i < n; i++)
 				s += std::string(i ? ", " : "") + "(t." + comp_name(i) + " ? b." + comp_name(i) + " : a." +
@@ -746,7 +765,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 		// isnan / isinf answer per component
 		for (const char *q : { "isnan", "isinf" })
 		{
-			std::string s = "static inline " + B + " " + P + "_" + q + "(" + V + " a) { return " + B + "(";
+			std::string s = "MGL_INL " + B + " " + P + "_" + q + "(" + V + " a) { return " + B + "(";
 			for (uint32_t i = 0; i < n; i++)
 				s += (i ? ", " : "") + e.call(q, e.at("a", i, n));
 			e.line(s + "); }");
@@ -757,10 +776,10 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			std::vector<std::string> parts;
 			for (uint32_t i = 0; i < n; i++)
 				parts.push_back(e.call("ldexp", e.at("a", i, n), "n." + std::string(comp_name(i))));
-			e.line("static inline " + V + " " + P + "_ldexp(" + V + " a, int" + std::to_string(n) +
+			e.line("MGL_INL " + V + " " + P + "_ldexp(" + V + " a, int" + std::to_string(n) +
 			       " n) { return " + e.build(n, parts) + "; }");
 
-			std::string s = "static inline " + V + " " + P + "_frexp(" + V + " a, thread int" +
+			std::string s = "MGL_INL " + V + " " + P + "_frexp(" + V + " a, thread int" +
 			                std::to_string(n) + " &n) { " + V + " r;";
 			for (uint32_t i = 0; i < n; i++)
 			{
@@ -770,7 +789,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			}
 			e.line(s + " return r; }");
 
-			s = "static inline " + V + " " + P + "_modf(" + V + " a, thread " + V + " &ip) { return " + V + "{";
+			s = "MGL_INL " + V + " " + P + "_modf(" + V + " a, thread " + V + " &ip) { return " + V + "{";
 			for (uint32_t i = 0; i < n; i++)
 			{
 				std::string c = comp_name(i);
@@ -787,24 +806,24 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				std::string term = e.mul(e.at("a", i, n), e.at("b", i, n));
 				dot = i ? e.add(dot, term) : term;
 			}
-			e.line("static inline " + P + " " + P + "_dot" + std::to_string(n) + "(" + V + " a, " + V +
+			e.line("MGL_INL " + P + " " + P + "_dot" + std::to_string(n) + "(" + V + " a, " + V +
 			       " b) { return " + dot + "; }");
-			e.line("static inline " + P + " " + P + "_length" + std::to_string(n) + "(" + V + " a) { return " +
+			e.line("MGL_INL " + P + " " + P + "_length" + std::to_string(n) + "(" + V + " a) { return " +
 			       e.call("sqrt", P + "_dot" + std::to_string(n) + "(a, a)") + "; }");
-			e.line("static inline " + P + " " + P + "_distance" + std::to_string(n) + "(" + V + " a, " + V +
+			e.line("MGL_INL " + P + " " + P + "_distance" + std::to_string(n) + "(" + V + " a, " + V +
 			       " b) { return " + P + "_length" + std::to_string(n) + "(" + P + "_sub(a, b)); }");
-			e.line("static inline " + V + " " + P + "_normalize" + std::to_string(n) + "(" + V +
+			e.line("MGL_INL " + V + " " + P + "_normalize" + std::to_string(n) + "(" + V +
 			       " a) { return " + P + "_mul(a, " + e.div(e.lit(1.0f), P + "_length" + std::to_string(n) + "(a)") +
 			       "); }");
 			// reflect: a - 2 * dot(nrm, a) * nrm
-			e.line("static inline " + V + " " + P + "_reflect" + std::to_string(n) + "(" + V + " a, " + V +
+			e.line("MGL_INL " + V + " " + P + "_reflect" + std::to_string(n) + "(" + V + " a, " + V +
 			       " nrm) { return " + P + "_sub(a, " + P + "_mul(nrm, " +
 			       e.mul(e.lit(2.0f), P + "_dot" + std::to_string(n) + "(nrm, a)") + ")); }");
 			// faceforward: dot(ref, i) < 0 ? n : -n
-			e.line("static inline " + V + " " + P + "_faceforward" + std::to_string(n) + "(" + V + " nrm, " + V +
+			e.line("MGL_INL " + V + " " + P + "_faceforward" + std::to_string(n) + "(" + V + " nrm, " + V +
 			       " i, " + V + " ref) { return " + P + "_lt(" + P + "_dot" + std::to_string(n) +
 			       "(ref, i), " + e.lit(0.0f) + ") ? nrm : " + P + "_neg(nrm); }");
-			e.line("static inline " + V + " " + P + "_refract" + std::to_string(n) + "(" + V + " i, " + V +
+			e.line("MGL_INL " + V + " " + P + "_refract" + std::to_string(n) + "(" + V + " i, " + V +
 			       " nrm, " + P + " eta) {");
 			e.line("    " + P + " d = " + P + "_dot" + std::to_string(n) + "(nrm, i);");
 			e.line("    " + P + " k = " + e.sub(e.lit(1.0f), e.mul(e.mul("eta", "eta"),
@@ -822,7 +841,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			for (uint32_t i = 0; i < 3; i++)
 				parts.push_back(e.sub(e.mul("a." + std::string(comp_name(a1[i])), "b." + std::string(comp_name(a2[i]))),
 				                      e.mul("a." + std::string(comp_name(a2[i])), "b." + std::string(comp_name(a1[i])))));
-			e.line("static inline " + V + " " + P + "_cross(" + V + " a, " + V + " b) { return " + e.build(3, parts) +
+			e.line("MGL_INL " + V + " " + P + "_cross(" + V + " a, " + V + " b) { return " + e.build(3, parts) +
 			       "; }");
 		}
 		e.line("");
@@ -872,14 +891,14 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				std::vector<std::string> parts;
 				for (uint32_t i = 0; i < cols; i++)
 					parts.push_back(e.call(op, e.col("a", i), e.col("b", i)));
-				e.line("static inline " + M + " " + P + "_" + b + "(" + M + " a, " + M + " b) { return " +
+				e.line("MGL_INL " + M + " " + P + "_" + b + "(" + M + " a, " + M + " b) { return " +
 				       e.buildMat(cols, rows, parts) + "; }");
 			}
 			{
 				std::vector<std::string> parts;
 				for (uint32_t i = 0; i < cols; i++)
 					parts.push_back(e.call("neg", e.col("a", i)));
-				e.line("static inline " + M + " " + P + "_neg(" + M + " a) { return " +
+				e.line("MGL_INL " + M + " " + P + "_neg(" + M + " a) { return " +
 				       e.buildMat(cols, rows, parts) + "; }");
 			}
 			{
@@ -889,9 +908,9 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 					ms.push_back(e.call("mul", e.col("a", i), "b"));
 					sm.push_back(e.call("mul", "a", e.col("b", i)));
 				}
-				e.line("static inline " + M + " " + P + "_mul(" + M + " a, " + P + " b) { return " +
+				e.line("MGL_INL " + M + " " + P + "_mul(" + M + " a, " + P + " b) { return " +
 				       e.buildMat(cols, rows, ms) + "; }");
-				e.line("static inline " + M + " " + P + "_mul(" + P + " a, " + M + " b) { return " +
+				e.line("MGL_INL " + M + " " + P + "_mul(" + P + " a, " + M + " b) { return " +
 				       e.buildMat(cols, rows, sm) + "; }");
 			}
 			// matrix * vector: sum of columns scaled by the vector's components
@@ -907,7 +926,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 					}
 					parts.push_back(sum);
 				}
-				e.line("static inline " + VR + " " + P + "_mul(" + M + " a, " + VC + " b) { return " +
+				e.line("MGL_INL " + VR + " " + P + "_mul(" + M + " a, " + VC + " b) { return " +
 				       e.build(rows, parts) + "; }");
 			}
 			// vector * matrix: each result component is a dot with one column
@@ -923,7 +942,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 					}
 					parts.push_back(sum);
 				}
-				e.line("static inline " + VC + " " + P + "_mul(" + VR + " a, " + M + " b) { return " +
+				e.line("MGL_INL " + VC + " " + P + "_mul(" + VR + " a, " + M + " b) { return " +
 				       e.build(cols, parts) + "; }");
 			}
 			// transpose
@@ -936,7 +955,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 						comps.push_back(e.col("a", c) + "." + comp_name(r));
 					parts.push_back(e.build(cols, comps));
 				}
-				e.line("static inline " + e.mat(rows, cols) + " " + P + "_transpose(" + M + " a) { return " +
+				e.line("MGL_INL " + e.mat(rows, cols) + " " + P + "_transpose(" + M + " a) { return " +
 				       e.buildMat(rows, cols, parts) + "; }");
 			}
 			// outer product of a rows-vector and a cols-vector makes this shape
@@ -949,7 +968,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 						comps.push_back(e.mul("a." + std::string(comp_name(r)), "b." + std::string(comp_name(c))));
 					parts.push_back(e.build(rows, comps));
 				}
-				e.line("static inline " + M + " " + P + "_outer(" + VR + " a, " + VC + " b) { return " +
+				e.line("MGL_INL " + M + " " + P + "_outer(" + VR + " a, " + VC + " b) { return " +
 				       e.buildMat(cols, rows, parts) + "; }");
 			}
 		}
@@ -978,7 +997,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 					}
 					parts.push_back(e.build(rows, comps));
 				}
-				e.line("static inline " + e.mat(bcols, rows) + " " + P + "_mul(" + e.mat(cols, rows) + " a, " +
+				e.line("MGL_INL " + e.mat(bcols, rows) + " " + P + "_mul(" + e.mat(cols, rows) + " a, " +
 				       e.mat(bcols, cols) + " b) { return " + e.buildMat(bcols, rows, parts) + "; }");
 			}
 
@@ -1012,7 +1031,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 		std::vector<uint32_t> all;
 		for (uint32_t i = 0; i < n; i++)
 			all.push_back(i);
-		e.line("static inline " + P + " " + P + "_determinant(" + M + " a) { return " + det(all, all) + "; }");
+		e.line("MGL_INL " + P + " " + P + "_determinant(" + M + " a) { return " + det(all, all) + "; }");
 
 		// inverse from the adjugate; the cofactor of (c,r) lands at (r,c)
 		std::vector<std::string> parts;
@@ -1037,7 +1056,7 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			}
 			parts.push_back(e.build(n, comps));
 		}
-		e.line("static inline " + M + " " + P + "_inverse(" + M + " a) {");
+		e.line("MGL_INL " + M + " " + P + "_inverse(" + M + " a) {");
 		e.line("    " + P + " inv_det = " + e.div(e.lit(1.0f), P + "_determinant(a)") + ";");
 		e.line("    return " + e.buildMat(n, n, parts) + "; }");
 	}
