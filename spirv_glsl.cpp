@@ -8171,7 +8171,7 @@ void CompilerGLSL::emit_mix_op(uint32_t result_type, uint32_t id, uint32_t left,
 		inherit_expression_dependencies(id, lerp);
 	}
 	else if (lerptype.basetype == SPIRType::Boolean)
-		emit_trinary_func_op(result_type, id, left, right, lerp, backend.boolean_mix_function);
+		emit_trinary_func_op(result_type, id, left, right, lerp, boolean_mix_function_for(restype).c_str());
 	else
 		emit_trinary_func_op(result_type, id, left, right, lerp, "mix");
 }

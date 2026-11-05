@@ -799,6 +799,34 @@ spvc_result spvc_compiler_options_set_uint(spvc_compiler_options options, spvc_c
 	case SPVC_COMPILER_OPTION_MSL_RUNTIME_CLIP_DEPTH:
 		options->msl.runtime_clip_depth = value != 0;
 		break;
+
+	case SPVC_COMPILER_OPTION_MSL_TEXTURE_PARAMS:
+		options->msl.texture_params = value != 0;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_TEXTURE_PARAMS_BUFFER_INDEX:
+		options->msl.texture_params_buffer_index = value;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_FLOAT_TESS_FACTORS:
+		options->msl.float_tess_factors = value != 0;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_PLAIN_UNIFORM_TABLE_INDEX:
+		options->msl.plain_uniform_table_index = value;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_POINT_COORD_FLIP_BUFFER_INDEX:
+		options->msl.point_coord_flip_buffer_index = value;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_MS_STORAGE_IMAGE_LAYERS:
+		options->msl.ms_storage_image_layers = value != 0;
+		break;
+
+	case SPVC_COMPILER_OPTION_MSL_SAMPLE_MASK_BUFFER_INDEX:
+		options->msl.sample_mask_buffer_index = value;
+		break;
 #endif
 
 	default:

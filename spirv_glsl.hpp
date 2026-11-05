@@ -735,9 +735,14 @@ protected:
 	bool should_forward(uint32_t id) const;
 	bool should_suppress_usage_tracking(uint32_t id) const;
 	void emit_mix_op(uint32_t result_type, uint32_t id, uint32_t left, uint32_t right, uint32_t lerp);
+	virtual std::string boolean_mix_function_for(const SPIRType &)
+	{
+		return backend.boolean_mix_function;
+	}
 	void emit_nminmax_op(uint32_t result_type, uint32_t id, uint32_t op0, uint32_t op1, GLSLstd450 op);
 	void emit_emulated_ahyper_op(uint32_t result_type, uint32_t result_id, uint32_t op0, GLSLstd450 op);
-	bool to_trivial_mix_op(const SPIRType &type, std::string &op, uint32_t left, uint32_t right, uint32_t lerp);
+	virtual bool to_trivial_mix_op(const SPIRType &type, std::string &op, uint32_t left, uint32_t right,
+	                               uint32_t lerp);
 	void emit_quaternary_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1, uint32_t op2,
 	                             uint32_t op3, const char *op);
 	void emit_trinary_func_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1, uint32_t op2,

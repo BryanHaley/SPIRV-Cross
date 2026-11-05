@@ -573,6 +573,30 @@ public:
 		// zero-to-one depth mode.
 		bool runtime_clip_depth = false;
 
+		// MGL: GL texture state Metal samplers cannot hold (LOD bias, a border
+		// colour other than black or white) comes from a spvTexParam array in
+		// this buffer slot, indexed by the texture's Metal slot.
+		bool texture_params = false;
+
+		// MGL: tessellation factors written as floats in quad layout, for a
+		// control stage whose levels are read by MGL rather than Metal
+		bool float_tess_factors = false;
+		uint32_t texture_params_buffer_index = 0;
+		// MGL: when not ~0u, plain GL uniforms are reached through one table of
+		// pointers at this buffer index rather than a buffer each, and their
+		// resource index is their place in the table
+		uint32_t plain_uniform_table_index = ~0u;
+		// MGL: when not ~0u, a fragment shader reading gl_PointCoord takes a uint
+		// at this buffer index, and turns the coordinate upside down when it is set
+		uint32_t point_coord_flip_buffer_index = ~0u;
+		// MGL: a multisampled storage image is a 2D array texture with one layer
+		// per sample, layer * samples + sample for an arrayed one, the sample
+		// count coming from the texture's spvTexParam
+		bool ms_storage_image_layers = false;
+		// MGL: when not ~0u, a fragment shader's sample mask is ANDed with a uint
+		// read from this buffer index
+		uint32_t sample_mask_buffer_index = ~0u;
+
 		bool is_ios() const
 		{
 			return platform == iOS;
@@ -949,6 +973,11 @@ protected:
 	std::string to_ptr_expression(uint32_t id, bool register_expression_read = true);
 	void emit_binary_unord_op(uint32_t result_type, uint32_t result_id, uint32_t op0, uint32_t op1, const char *op);
 	void emit_instruction(const Instruction &instr) override;
+	// MGL: an emulated double vector selects through its own helper
+	std::string boolean_mix_function_for(const SPIRType &type) override;
+	// MGL: an emulated double has no cast from bool
+	bool to_trivial_mix_op(const SPIRType &type, std::string &op, uint32_t left, uint32_t right,
+	                       uint32_t lerp) override;
 	void emit_glsl_op(uint32_t result_type, uint32_t result_id, uint32_t op, const uint32_t *args,
 	                  uint32_t count) override;
 	void emit_spv_amd_shader_trinary_minmax_op(uint32_t result_type, uint32_t result_id, uint32_t op,
@@ -1046,6 +1075,8 @@ protected:
 	SPIRType get_fp64_column_type(const SPIRType &type) const;
 	std::string fp64_component_expression(uint32_t id, uint32_t index);
 	bool is_fp64_plain_uniform(uint32_t var_id) const;
+	bool is_plain_uniform_in_table(const SPIRVariable &var) const;
+	std::unordered_set<uint32_t> plain_uniforms_in_table_args;
 	bool emit_fp64_instruction(const Instruction &instruction);
 	std::string fp64_plain_uniform_expression(uint32_t var_id);
 	std::string fp64_plain_uniform_slots_name(uint32_t var_id);
@@ -1215,6 +1246,7 @@ protected:
 	SPIRType &get_patch_stage_in_struct_type();
 	SPIRType &get_patch_stage_out_struct_type();
 	std::string get_tess_factor_struct_name();
+	std::string tess_factor_cast();
 	SPIRType &get_uint_type();
 	uint32_t get_uint_type_id();
 	void emit_atomic_func_op(uint32_t result_type, uint32_t result_id, const char *op, Op opcode,
@@ -1316,6 +1348,7 @@ protected:
 	std::unordered_map<StageSetBinding, uint32_t, InternalHasher> resource_arg_buff_idx_to_binding_number;
 
 	uint32_t next_metal_resource_index_buffer = 0;
+	uint32_t next_plain_uniform_table_index = 0;
 	uint32_t next_metal_resource_index_texture = 0;
 	uint32_t next_metal_resource_index_sampler = 0;
 	// Intentionally uninitialized, works around MSVC 2013 bug.
@@ -1354,6 +1387,13 @@ protected:
 	bool capture_output_to_buffer = false;
 	bool needs_swizzle_buffer_def = false;
 	bool used_swizzle_buffer = false;
+	bool used_texture_params = false;
+	std::string texture_param_expression(uint32_t img);
+	bool has_texture_param_arg(const SPIRType &type, uint32_t id) const;
+	void add_texture_param_typedefs();
+	bool is_ms_storage_layers(const SPIRType &type) const;
+	std::string ms_storage_layer(uint32_t img, const std::string &coord, uint32_t sample_id, bool arrayed);
+	std::string ms_storage_samples(uint32_t img);
 	bool added_builtin_tess_level = false;
 	bool needs_local_invocation_index = false;
 	bool needs_subgroup_invocation_id = false;
@@ -1453,7 +1493,11 @@ protected:
 		       msl_options.check_discarded_frag_stores && frag_shader_needs_discard_checks;
 	}
 
-	bool has_additional_fixed_sample_mask() const { return msl_options.additional_fixed_sample_mask != 0xffffffff; }
+	bool has_additional_fixed_sample_mask() const
+	{
+		return msl_options.additional_fixed_sample_mask != 0xffffffff ||
+		       (msl_options.sample_mask_buffer_index != ~0u && get_execution_model() == spv::ExecutionModelFragment);
+	}
 	std::string additional_fixed_sample_mask_str() const;
 
 	// OpcodeHandler that handles several MSL preprocessing operations.

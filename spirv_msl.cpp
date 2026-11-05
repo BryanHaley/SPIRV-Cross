@@ -1350,8 +1350,18 @@ SPIRType &CompilerMSL::get_patch_stage_out_struct_type()
 	return get_variable_data_type(so_var);
 }
 
+std::string CompilerMSL::tess_factor_cast()
+{
+	return msl_options.float_tess_factors ? "float(" : "half(";
+}
+
 std::string CompilerMSL::get_tess_factor_struct_name()
 {
+	if (msl_options.float_tess_factors)
+	{
+		add_typedef_line("struct spvQuadTessFactorsFloat { float edgeTessellationFactor[4]; float insideTessellationFactor[2]; };");
+		return "spvQuadTessFactorsFloat";
+	}
 	if (is_tessellating_triangles())
 		return "MTLTriangleTessellationFactorsHalf";
 	return "MTLQuadTessellationFactorsHalf";
@@ -1921,6 +1931,7 @@ string CompilerMSL::compile()
 
 		// Start bindings at zero.
 		next_metal_resource_index_buffer = 0;
+		next_plain_uniform_table_index = 0;
 		next_metal_resource_index_texture = 0;
 		next_metal_resource_index_sampler = 0;
 		for (auto &id : next_metal_resource_ids)
@@ -3184,6 +3195,23 @@ void CompilerMSL::add_plain_variable_to_interface_block(StorageClass storage, co
 	set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceOrigID, var.self);
 }
 
+std::string CompilerMSL::boolean_mix_function_for(const SPIRType &type)
+{
+	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double && type.vecsize > 1)
+		return std::string(get_fp64_type_name(msl_options.fp64_mode)) + "_select";
+
+	return CompilerGLSL::boolean_mix_function_for(type);
+}
+
+bool CompilerMSL::to_trivial_mix_op(const SPIRType &type, std::string &op, uint32_t left, uint32_t right,
+                                    uint32_t lerp)
+{
+	if (msl_options.fp64_mode != FP64Mode::Disabled && type.basetype == SPIRType::Double)
+		return false;
+
+	return CompilerGLSL::to_trivial_mix_op(type, op, left, right, lerp);
+}
+
 // A double varying crosses the stage boundary as one uint2 of binary64 bits per
 // component. Each slot sits where GL puts that double -- two to a location, at
 // components 0 and 2, a column wider than two starting a fresh location -- so a
@@ -3588,6 +3616,8 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 
 	// MGL: doubles go as binary64 slots, whatever their shape
 	if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && !meta.strip_array &&
+	    !(storage == StorageClassOutput && get_execution_model() == ExecutionModelVertex &&
+	      msl_options.vertex_for_tessellation) &&
 	    meta.allow_local_declaration && (storage == StorageClassInput || storage == StorageClassOutput) &&
 	    get<SPIRType>(var_type.member_types[mbr_idx]).basetype == SPIRType::Double)
 	{
@@ -3859,6 +3889,8 @@ void CompilerMSL::add_plain_member_variable_to_interface_block(StorageClass stor
 	// one flat uint2 per component, placed the way a plain double varying is.
 	// The block itself stays a local, and the fixups encode and decode.
 	if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && !meta.strip_array &&
+	    !(storage == StorageClassOutput && get_execution_model() == ExecutionModelVertex &&
+	      msl_options.vertex_for_tessellation) &&
 	    meta.allow_local_declaration && (storage == StorageClassInput || storage == StorageClassOutput) &&
 	    get<SPIRType>(var_type.member_types[mbr_idx]).basetype == SPIRType::Double)
 	{
@@ -4570,7 +4602,11 @@ void CompilerMSL::add_variable_to_interface_block(StorageClass storage, const st
 
 			// An emulated double is a struct, and Metal takes no struct across
 			// stages, so a double varying travels as its binary64 bits.
+			// MGL: a vertex stage feeding tessellation writes a device buffer the
+			// control stage reads as is, so nothing is encoded there
 			if (msl_options.fp64_mode != FP64Mode::Disabled && !is_builtin && storage_is_stage_io &&
+			    !(storage == StorageClassOutput && get_execution_model() == ExecutionModelVertex &&
+			      msl_options.vertex_for_tessellation) &&
 			    var_type.basetype == SPIRType::Double && var_type.array.size() <= 1)
 			{
 				add_fp64_variable_to_interface_block(storage, ib_var_ref, ib_type, var, meta);
@@ -5984,6 +6020,20 @@ std::string CompilerMSL::fp64_decode_expression(const SPIRType &type, const SPIR
 
 // A double declared straight in the default uniform block, rather than inside a
 // block of its own. It has no member offsets, so its slots pack tightly.
+// MGL: a plain GL uniform -- not a texture, sampler or image -- when they are
+// reached through one table of pointers
+bool CompilerMSL::is_plain_uniform_in_table(const SPIRVariable &var) const
+{
+	if (msl_options.plain_uniform_table_index == ~0u || var.storage != StorageClassUniformConstant)
+		return false;
+
+	auto &type = get_variable_data_type(var);
+
+	return type.basetype != SPIRType::Image && type.basetype != SPIRType::SampledImage &&
+	       type.basetype != SPIRType::Sampler && type.basetype != SPIRType::AccelerationStructure &&
+	       !type.pointer;
+}
+
 bool CompilerMSL::is_fp64_plain_uniform(uint32_t var_id) const
 {
 	if (msl_options.fp64_mode == FP64Mode::Disabled)
@@ -5998,7 +6048,9 @@ bool CompilerMSL::is_fp64_plain_uniform(uint32_t var_id) const
 		return false;
 
 	auto &type = get_variable_data_type(*var);
-	return type.basetype == SPIRType::Double && type.array.empty();
+	// MGL: a one-dimensional array of them is packed the same way, element after element
+	return type.basetype == SPIRType::Double && type.array.size() <= 1 &&
+	       (type.array.empty() || (type.array_size_literal[0] && type.array[0] > 0));
 }
 
 // Rebuilds the value from the slots a plain uniform points at, which are packed
@@ -6044,23 +6096,39 @@ std::string CompilerMSL::fp64_plain_uniform_expression(uint32_t var_id)
 	auto &type = get_variable_data_type(get<SPIRVariable>(var_id));
 	const char *decode = get_fp64_decode_name(msl_options.fp64_mode);
 	std::string name = fp64_plain_uniform_slots_name(var_id);
+	SPIRType elem = type;
 
-	if (type.vecsize == 1 && type.columns == 1)
-		return join(decode, "(", name, "[0])");
+	elem.array.clear();
+	elem.array_size_literal.clear();
 
-	std::string result = type_to_glsl(type) + "{";
-	for (uint32_t c = 0; c < type.columns; c++)
-	{
-		if (c)
-			result += ", ";
-		if (type.columns > 1)
-			result += type_to_glsl(get_fp64_column_type(type)) + "{";
-		for (uint32_t r = 0; r < type.vecsize; r++)
-			result += join(r ? ", " : "", decode, "(", name, "[", c * type.vecsize + r, "])");
-		if (type.columns > 1)
-			result += "}";
-	}
-	return result + "}";
+	uint32_t per = type.vecsize * type.columns;
+
+	auto one = [&](uint32_t base) -> std::string {
+		if (elem.vecsize == 1 && elem.columns == 1)
+			return join(decode, "(", name, "[", base, "])");
+
+		std::string result = type_to_glsl(elem) + "{";
+		for (uint32_t c = 0; c < elem.columns; c++)
+		{
+			if (c)
+				result += ", ";
+			if (elem.columns > 1)
+				result += type_to_glsl(get_fp64_column_type(elem)) + "{";
+			for (uint32_t r = 0; r < elem.vecsize; r++)
+				result += join(r ? ", " : "", decode, "(", name, "[", base + c * elem.vecsize + r, "])");
+			if (elem.columns > 1)
+				result += "}";
+		}
+		return result + "}";
+	};
+
+	if (type.array.empty())
+		return one(0);
+
+	std::string result = type_to_glsl(type) + "{{";
+	for (uint32_t e = 0; e < type.array[0]; e++)
+		result += (e ? ", " : "") + one(e * per);
+	return result + "}}";
 }
 
 // One component of an emulated vector. The value may still be sitting in its
@@ -11071,6 +11139,23 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			statement("spvImageFence(", to_expression(img_id), ");");
 		}
 
+		// MGL: one layer per sample
+		if (is_ms_storage_layers(get<SPIRType>(type.self)))
+		{
+			uint32_t sample = 0;
+			if (instruction.length > 5 && (ops[4] & ImageOperandsSampleMask))
+				sample = ops[5];
+			auto &img_type = get<SPIRType>(type.self);
+			string coord = to_enclosed_expression(ops[3]);
+			string layer = sample ? ms_storage_layer(img_id, coord, sample, img_type.image.arrayed) : string("0u");
+			auto &rtype = get<SPIRType>(ops[0]);
+			string expr = join(to_expression(img_id), ".read(uint2(", coord, ".xy), ", layer, ")");
+			if (rtype.vecsize < 4)
+				expr += vector_swizzle(rtype.vecsize, 0);
+			emit_op(ops[0], ops[1], expr, false);
+			break;
+		}
+
 		emit_texture_op(instruction, false);
 		break;
 	}
@@ -11105,9 +11190,16 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			// Virtual expression. Split this up in the actual image atomic.
 			// In GLSL and HLSL we are able to resolve the dereference inline, but MSL has
 			// image.op(coord, ...) syntax.
+			string coord = bitcast_expression(SPIRType::UInt, ops[3]);
+			auto &ptr_img = get<SPIRType>(expression_type(ops[2]).self);
+			// MGL: one layer per sample, which makes the texel's address three-part
+			if (is_ms_storage_layers(ptr_img))
+			{
+				string c = join("(", coord, ")");
+				coord = join("uint3(", c, ".xy, ", ms_storage_layer(ops[2], c, ops[4], ptr_img.image.arrayed), ")");
+			}
 			auto &e =
-				set<SPIRExpression>(id, join(to_expression(ops[2]), "@",
-				                             bitcast_expression(SPIRType::UInt, ops[3])),
+				set<SPIRExpression>(id, join(to_expression(ops[2]), "@", coord),
 				                    result_type, true);
 
 			// When using the pointer, we need to know which variable it is actually loaded from.
@@ -11164,6 +11256,21 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		auto store_type = texel_type;
 		store_type.vecsize = 4;
 
+		// MGL: one layer per sample
+		if (is_ms_storage_layers(img_type))
+		{
+			uint32_t sample = 0;
+			if (length && (flags & ImageOperandsSampleMask))
+				sample = *opt;
+			string coord = to_enclosed_expression(coord_id);
+			string layer = sample ? ms_storage_layer(img_id, coord, sample, img_type.image.arrayed) : string("0u");
+			statement(to_expression(img_id), ".write(", remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)),
+			          ", uint2(", coord, ".xy), ", layer, ");");
+			if (p_var && variable_storage_is_aliased(*p_var))
+				flush_all_aliased_variables();
+			break;
+		}
+
 		TextureFunctionArguments args = {};
 		args.base.img = img_id;
 		args.base.imgtype = &img_type;
@@ -11211,6 +11318,17 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			string decl_lod = to_expression(ops[3]);
 			if (decl_lod != "0")
 				lod = decl_lod;
+		}
+
+		// MGL: one layer per sample
+		if (is_ms_storage_layers(get<SPIRType>(img_type.self)))
+		{
+			string e = type_to_glsl(rslt_type) + "(" + img_exp + ".get_width(), " + img_exp + ".get_height()";
+			if (img_is_array)
+				e += ", " + img_exp + ".get_array_size() / " + ms_storage_samples(img_id);
+			e += ")";
+			emit_op(rslt_type_id, id, e, should_forward(img_id));
+			break;
 		}
 
 		string expr = type_to_glsl(rslt_type) + "(";
@@ -11309,6 +11427,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 
 	case OpImageQuerySamples:
+		// MGL: one layer per sample
+		if (is_ms_storage_layers(get<SPIRType>(expression_type(ops[2]).self)))
+		{
+			emit_op(ops[0], ops[1], join(type_to_glsl(get<SPIRType>(ops[0])), "(", ms_storage_samples(ops[2]), ")"), false);
+			break;
+		}
 		MSL_ImgQry(samples);
 		break;
 
@@ -12651,11 +12775,11 @@ bool CompilerMSL::maybe_emit_array_assignment(uint32_t id_lhs, uint32_t id_rhs)
 		{
 			uint32_t array_size = get_physical_tess_level_array_size(builtin);
 			if (array_size == 1)
-				statement(to_expression(id_lhs), " = half(", to_expression(id_rhs), "[0]);");
+				statement(to_expression(id_lhs), " = ", tess_factor_cast(), to_expression(id_rhs), "[0]);");
 			else
 			{
 				for (uint32_t i = 0; i < array_size; i++)
-					statement(to_expression(id_lhs), "[", i, "] = half(", to_expression(id_rhs), "[", i, "]);");
+					statement(to_expression(id_lhs), "[", i, "] = ", tess_factor_cast(), to_expression(id_rhs), "[", i, "]);");
 			}
 			return true;
 		}
@@ -12778,7 +12902,8 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, 
 			}
 
 			exp += join(image_expr, ".", op, "(");
-			if (ptr_type.storage == StorageClassImage && (res_type->image.arrayed || res_type->image.dim == DimCube))
+			if (ptr_type.storage == StorageClassImage &&
+			    (res_type->image.arrayed || res_type->image.dim == DimCube || is_ms_storage_layers(*res_type)))
 			{
 				switch (res_type->image.dim)
 				{
@@ -13782,6 +13907,12 @@ void CompilerMSL::emit_function_prototype(SPIRFunction &func, const Bitset &)
 			decl += join(", constant uint", arg_is_array ? "* " : "& ", to_buffer_size_expression(name_id));
 		}
 
+		if (has_texture_param_arg(arg_type, arg.id))
+		{
+			add_texture_param_typedefs();
+			decl += join(", constant spvTexParam& ", to_name(arg.id), "TexP");
+		}
+
 		if (&arg != &func.arguments.back())
 			decl += ", ";
 	}
@@ -14241,7 +14372,30 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	}
 	else
 	{
-		farg_str += tex_coords;
+		// MGL: GL cube maps are not seamless unless asked; keep the filter on one face
+		string cube_param;
+		if (imgtype.image.dim == DimCube && !is_cube_fetch && !args.base.is_gather && !grad_x)
+			cube_param = texture_param_expression(img);
+		if (!cube_param.empty())
+		{
+			VariableID base_img = img;
+			if (auto *combined = maybe_get<SPIRCombinedImageSampler>(img))
+				base_img = combined->image;
+			string lod_expr = lod ? convert_to_f32(to_unpacked_expression(lod), 1) : "0.0";
+			add_typedef_line("template<typename T> inline float3 spvCubeClamp(float3 d, constant spvTexParam& p, "
+			                 "T t, float lod) { if ((p.border & 8u) == 0u) return d; float3 a = abs(d); "
+			                 "float w = float(t.get_width(min(uint(max(lod + p.lodBias, 0.0)), "
+			                 "t.get_num_mip_levels() - 1u))); "
+			                 "if (a.x >= a.y && a.x >= a.z) { float k = a.x * (1.0 - 1.0 / w); "
+			                 "return float3(d.x, clamp(d.yz, -k, k)); } "
+			                 "if (a.y >= a.z) { float k = a.y * (1.0 - 1.0 / w); "
+			                 "return float3(clamp(d.x, -k, k), d.y, clamp(d.z, -k, k)); } "
+			                 "float k = a.z * (1.0 - 1.0 / w); return float3(clamp(d.xy, -k, k), d.z); }");
+			farg_str += join("spvCubeClamp(", tex_coords, ", ", cube_param, ", ", to_expression(base_img), ", ",
+			                 lod_expr, ")");
+		}
+		else
+			farg_str += tex_coords;
 
 		// If fetch from cube, add face explicitly
 		if (is_cube_fetch)
@@ -14345,13 +14499,37 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		}
 	}
 
+	// MGL: GL adds the texture's LOD bias to every level of detail, implicit or
+	// given; outside the fragment stage an implicit one starts at level 0
+	string tex_bias;
+	if (!grad_x && !args.base.is_fetch && !args.base.is_gather && imgtype.image.dim != DimBuffer &&
+	    !imgtype.image.ms && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
+	{
+		string param = texture_param_expression(img);
+		if (!param.empty())
+			tex_bias = param + ".lodBias";
+	}
+	if (!tex_bias.empty() && !lod && get_execution_model() != ExecutionModelFragment)
+	{
+		farg_str += ", level(" + tex_bias + ")";
+		tex_bias.clear();
+	}
+	string lod_bias = lod ? tex_bias : string();
+	if (lod)
+		tex_bias.clear();
+
 	// LOD Options
 	// Metal does not support LOD for 1D textures.
 	if (bias && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
 	{
 		forward = forward && should_forward(bias);
-		farg_str += ", bias(" + to_unpacked_expression(bias) + ")";
+		if (tex_bias.empty())
+			farg_str += ", bias(" + to_unpacked_expression(bias) + ")";
+		else
+			farg_str += ", bias(" + to_enclosed_unpacked_expression(bias) + " + " + tex_bias + ")";
 	}
+	else if (!tex_bias.empty())
+		farg_str += ", bias(" + tex_bias + ")";
 
 	// Metal does not support LOD for 1D textures.
 	if (lod && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
@@ -14418,6 +14596,10 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 			}
 			farg_str += join(", ", grad_opt, "(", grad_coord, "exp2(", to_unpacked_expression(lod), " - 0.5) / ", extent,
 			                 ", exp2(", to_unpacked_expression(lod), " - 0.5) / ", extent, ")");
+		}
+		else if (!lod_bias.empty())
+		{
+			farg_str += ", level(" + to_enclosed_unpacked_expression(lod) + " + " + lod_bias + ")";
 		}
 		else
 		{
@@ -14589,6 +14771,92 @@ void CompilerMSL::emit_sampled_image_op(uint32_t result_type, uint32_t result_id
 	set<SPIRCombinedImageSampler>(result_id, result_type, image_id, samp_id);
 }
 
+// MGL: a multisampled storage image kept as a layer per sample
+bool CompilerMSL::is_ms_storage_layers(const SPIRType &type) const
+{
+	return msl_options.ms_storage_image_layers && type.basetype == SPIRType::Image && type.image.ms &&
+	       type.image.sampled == 2 && type.image.dim == Dim2D;
+}
+
+string CompilerMSL::ms_storage_samples(uint32_t img)
+{
+	string param = texture_param_expression(img);
+	return param.empty() ? string("1u") : join("max(", param, ".pad.x, 1u)");
+}
+
+// the layer holding one sample of one texel
+string CompilerMSL::ms_storage_layer(uint32_t img, const string &coord, uint32_t sample_id, bool arrayed)
+{
+	string sample = join("uint(", to_expression(sample_id), ")");
+	if (!arrayed)
+		return sample;
+	return join("uint(", coord, ".z) * ", ms_storage_samples(img), " + ", sample);
+}
+
+// MGL: the spvTexParam record for a sampled texture, or "" when there is none
+string CompilerMSL::texture_param_expression(uint32_t img)
+{
+	if (!msl_options.texture_params || !current_function)
+		return "";
+
+	if (current_function->self != ir.default_entry_point)
+	{
+		auto *var = maybe_get_backing_variable(img);
+		// a local copy of a parameter leads back to the parameter
+		if (var && var->static_expression)
+			if (auto *from = maybe_get_backing_variable(var->static_expression))
+				var = from;
+		uint32_t id = var ? uint32_t(var->self) : img;
+		for (auto &arg : current_function->arguments)
+		{
+			auto *arg_var = maybe_get<SPIRVariable>(arg.id);
+			bool same = arg.id == id || (arg_var && arg_var->basevariable == id);
+			if (same && has_texture_param_arg(get<SPIRType>(arg.type), arg.id))
+			{
+				add_texture_param_typedefs();
+				return to_name(arg.id) + "TexP";
+			}
+		}
+		return "";
+	}
+
+	auto *var = maybe_get_backing_variable(img);
+	if (!var)
+		return "";
+
+	auto &vtype = get<SPIRType>(var->basetype);
+	if (vtype.basetype != SPIRType::SampledImage && vtype.basetype != SPIRType::Image)
+		return "";
+
+	uint32_t slot = get_metal_resource_index(*var, SPIRType::Image);
+	add_texture_param_typedefs();
+	return join("spvTexParams[", slot, "]");
+}
+
+// MGL: an image passed to a helper function carries its spvTexParam alongside
+bool CompilerMSL::has_texture_param_arg(const SPIRType &type, uint32_t id) const
+{
+	return msl_options.texture_params &&
+	       (type.basetype == SPIRType::Image || type.basetype == SPIRType::SampledImage) &&
+	       type.image.dim != DimBuffer && type.array.empty() &&
+	       !has_extended_decoration(id, SPIRVCrossDecorationDynamicImageSampler);
+}
+
+void CompilerMSL::add_texture_param_typedefs()
+{
+	add_typedef_line("struct spvTexParam { float lodBias; uint border; uint2 pad; uint4 borderBits; };");
+	add_typedef_line("template<typename T> inline vec<T, 4> spvTexBorder(vec<T, 4> v, constant spvTexParam& p, "
+	                 "float3 c) { bool3 o = c < 0.0 || c >= 1.0; if ((((p.border & 1u) != 0u) && o.x) || "
+	                 "(((p.border & 2u) != 0u) && o.y) || (((p.border & 4u) != 0u) && o.z)) "
+	                 "return as_type<vec<T, 4>>(p.borderBits); return v; }");
+
+	if (!used_texture_params)
+	{
+		used_texture_params = true;
+		force_recompile();
+	}
+}
+
 string CompilerMSL::to_texture_op(const Instruction &i, bool sparse, bool *forward,
                                   SmallVector<uint32_t> &inherited_expressions)
 {
@@ -14663,6 +14931,75 @@ string CompilerMSL::to_texture_op(const Instruction &i, bool sparse, bool *forwa
 	}
 
 	string inner_expr = CompilerGLSL::to_texture_op(i, sparse, forward, inherited_expressions);
+
+	// MGL: a plain sample whose coordinate leaves the texture on a clamp-to-border
+	// axis returns the GL border colour, which Metal's sampler cannot hold
+	if ((op == OpImageSampleImplicitLod || op == OpImageSampleExplicitLod) && !sparse &&
+	    result_type.vecsize == 4 && imgtype.image.dim != DimCube && imgtype.image.dim != DimBuffer &&
+	    !imgtype.image.depth)
+	{
+		string param = texture_param_expression(img);
+		if (!param.empty())
+		{
+			// unused positions are 0.5, inside the texture
+			uint32_t comps = imgtype.image.dim == Dim3D ? 3 : (imgtype.image.dim == Dim1D ? 1 : 2);
+			uint32_t have = expression_type(ops[3]).vecsize;
+			string coord = to_enclosed_expression(ops[3]);
+			string c3;
+			if (comps == 1)
+				c3 = join("float3(", have == 1 ? coord : coord + ".x", ", 0.5, 0.5)");
+			else if (comps == 2)
+				c3 = join("float3(", coord, ".xy, 0.5)");
+			else
+				c3 = join("float3(", coord, ".xyz)");
+			inner_expr = join("spvTexBorder(", inner_expr, ", ", param, ", ", c3, ")");
+		}
+	}
+
+	// MGL: the same for each of a gather's four texels
+	if (op == OpImageGather && !sparse && result_type.vecsize == 4 && imgtype.image.dim == Dim2D &&
+	    !imgtype.image.depth && i.length >= 5)
+	{
+		string param = texture_param_expression(img);
+		if (!param.empty())
+		{
+			string off[4] = { "int2(0)", "int2(0)", "int2(0)", "int2(0)" };
+			bool each = false;
+			if (i.length > 5)
+			{
+				uint32_t mask = ops[5], k = 6;
+				if (mask & ImageOperandsBiasMask) k++;
+				if (mask & ImageOperandsLodMask) k++;
+				if (mask & ImageOperandsGradMask) k += 2;
+				if ((mask & (ImageOperandsConstOffsetMask | ImageOperandsOffsetMask)) && k < i.length)
+				{
+					string o = join("int2(", to_expression(ops[k]), ")");
+					for (auto &e : off)
+						e = o;
+				}
+				else if ((mask & ImageOperandsConstOffsetsMask) && k < i.length)
+				{
+					string o = to_enclosed_expression(ops[k]);
+					for (uint32_t e = 0; e < 4; e++)
+						off[e] = join("int2(", o, "[", e, "])");
+					each = true;
+				}
+			}
+
+			add_typedef_line("template<typename T, typename Tex> inline vec<T, 4> spvGatherBorder(vec<T, 4> v, "
+			                 "constant spvTexParam& p, Tex t, float2 c, int2 o0, int2 o1, int2 o2, int2 o3, uint comp, bool each) "
+			                 "{ if ((p.border & 3u) == 0u) return v; int2 sz = int2(t.get_width(), t.get_height()); "
+			                 "int2 b = int2(floor(c * float2(sz) - 0.5)); int n = each ? 0 : 1; "
+			                 "int2 q[4] = { b + int2(0, n) + o0, b + int2(n, n) + o1, b + int2(n, 0) + o2, b + o3 }; "
+			                 "T bc = as_type<vec<T, 4>>(p.borderBits)[comp & 3u]; "
+			                 "for (int k = 0; k < 4; k++) if ((((p.border & 1u) != 0u) && (q[k].x < 0 || q[k].x >= sz.x)) || "
+			                 "(((p.border & 2u) != 0u) && (q[k].y < 0 || q[k].y >= sz.y))) v[k] = bc; return v; }");
+
+			inner_expr = join("spvGatherBorder(", inner_expr, ", ", param, ", ", to_expression(img), ", ",
+			                  to_enclosed_expression(ops[3]), ".xy, ", off[0], ", ", off[1], ", ", off[2], ", ", off[3],
+			                  ", uint(", to_expression(ops[4]), "), ", each ? "true" : "false", ")");
+		}
+	}
 
 	if (constexpr_sampler && constexpr_sampler->ycbcr_conversion_enable && !is_dynamic_img_sampler)
 	{
@@ -14928,6 +15265,12 @@ string CompilerMSL::to_func_call_arg(const SPIRFunction::Parameter &arg, uint32_
 
 		if (is_dynamic_img_sampler)
 			arg_str += ")";
+	}
+
+	if (has_texture_param_arg(get<SPIRType>(arg.type), arg.id))
+	{
+		string param = texture_param_expression(var_id ? var_id : id);
+		arg_str += ", " + (param.empty() ? string("spvTexParam{}") : param);
 	}
 
 	// Emulate texture2D atomic operations
@@ -16393,6 +16736,30 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 		                msl_options.reversed_depth_viewport_buffer_index, ")]]");
 	}
 
+	if (used_texture_params)
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("constant spvTexParam* spvTexParams [[buffer(", msl_options.texture_params_buffer_index, ")]]");
+	}
+
+	// MGL: the sample mask is draw state
+	if (get_execution_model() == ExecutionModelFragment && msl_options.sample_mask_buffer_index != ~0u)
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("constant uint& spvSampleMaskU [[buffer(", msl_options.sample_mask_buffer_index, ")]]");
+	}
+
+	// MGL: which way up gl_PointCoord is depends on the render target
+	if (get_execution_model() == ExecutionModelFragment && active_input_builtins.get(BuiltInPointCoord) &&
+	    msl_options.point_coord_flip_buffer_index != ~0u)
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		ep_args += join("constant uint& spvPointCoordFlip [[buffer(", msl_options.point_coord_flip_buffer_index, ")]]");
+	}
+
 	if (capture_output_to_buffer)
 	{
 		// Add parameters to hold the indirect draw parameters and the shader output. This has to be handled
@@ -16488,7 +16855,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 					    for (uint32_t i = 0; i < components; i++)
 					    {
 						    statement(builtin_to_glsl(BuiltInTessLevelOuter, StorageClassOutput), "[", i,
-						              "] = ", "half(", to_expression(c->subconstants[i]), ");");
+						              "] = ", tess_factor_cast(), to_expression(c->subconstants[i]), ");");
 					    }
 				    });
 			}
@@ -16499,7 +16866,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 				if (is_tessellating_triangles())
 				{
 					entry_func.fixup_hooks_in.push_back([=]() {
-						statement(builtin_to_glsl(BuiltInTessLevelInner, StorageClassOutput), " = ", "half(",
+						statement(builtin_to_glsl(BuiltInTessLevelInner, StorageClassOutput), " = ", tess_factor_cast(),
 						          to_expression(c->subconstants[0]), ");");
 					});
 				}
@@ -16509,7 +16876,7 @@ void CompilerMSL::entry_point_args_builtin(string &ep_args)
 						for (uint32_t i = 0; i < 2; i++)
 						{
 							statement(builtin_to_glsl(BuiltInTessLevelInner, StorageClassOutput), "[", i, "] = ",
-							          "half(", to_expression(c->subconstants[i]), ");");
+							          tess_factor_cast(), to_expression(c->subconstants[i]), ");");
 						}
 					});
 				}
@@ -16678,6 +17045,7 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 	SmallVector<Resource> resources;
 
 	entry_point_bindings.clear();
+	plain_uniforms_in_table_args.clear();
 	ir.for_each_typed_id<SPIRVariable>([&](uint32_t var_id, SPIRVariable &var) {
 		if ((var.storage == StorageClassUniform || var.storage == StorageClassUniformConstant ||
 		     var.storage == StorageClassPushConstant || var.storage == StorageClassStorageBuffer) &&
@@ -16893,6 +17261,10 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 				}
 				is_using_builtin_array = false;
 			}
+			else if (is_plain_uniform_in_table(var) && !recursive_inputs.count(type.self))
+			{
+				plain_uniforms_in_table_args.insert(var_id);
+			}
 			else
 			{
 				if (!ep_args.empty())
@@ -16967,6 +17339,13 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 			break;
 		}
 		default:
+			if (is_plain_uniform_in_table(var))
+			{
+				plain_uniforms_in_table_args.insert(var_id);
+				if (is_fp64_plain_uniform(var_id))
+					fp64_plain_uniforms_with_args.insert(var_id);
+				break;
+			}
 			if (!ep_args.empty())
 				ep_args += ", ";
 			// A bare double uniform is a run of binary64 slots, so it arrives
@@ -16988,6 +17367,16 @@ void CompilerMSL::entry_point_args_discrete_descriptors(string &ep_args)
 			ep_args += "]]";
 			break;
 		}
+	}
+
+	if (!plain_uniforms_in_table_args.empty())
+	{
+		if (!ep_args.empty())
+			ep_args += ", ";
+		// a pointer to pointers is no buffer argument, a struct of them is
+		ep_args += "constant MglPlainEntry* mglPlainTable [[buffer(" +
+		           convert_to_string(msl_options.plain_uniform_table_index) + ")]]";
+
 	}
 }
 
@@ -17057,6 +17446,37 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 		auto &type = get_variable_data_type(var);
 		uint32_t var_id = var.self;
 		bool ssbo = has_decoration(type.self, DecorationBufferBlock);
+
+		// MGL: a plain uniform in the table takes its name back from its pointer,
+		// ahead of anything that reads it
+		if (is_plain_uniform_in_table(var) && !is_hidden_variable(var))
+		{
+			const char *decl = "struct MglPlainEntry { constant char* p; };";
+			bool have = false;
+
+			for (auto &h : header_lines)
+				have |= h == decl;
+
+			if (!have)
+				header_lines.push_back(decl);
+
+			auto hook = [this, &var, var_id]() {
+				if (!plain_uniforms_in_table_args.count(var_id))
+					return;
+
+				auto &vtype = get_variable_data_type(var);
+				uint32_t idx = get_metal_resource_index(var, vtype.basetype);
+
+				if (is_fp64_plain_uniform(var_id))
+					statement("constant uint2* ", fp64_plain_uniform_slots_name(var_id),
+					          " = (constant uint2*)mglPlainTable[", idx, "].p;");
+				else
+					statement("constant ", type_to_glsl(vtype, var_id), "& ", to_restrict(var_id, true),
+					          to_name(var_id), " = *(constant ", type_to_glsl(vtype, var_id),
+					          "*)mglPlainTable[", idx, "].p;");
+			};
+			entry_func.fixup_hooks_in.insert(entry_func.fixup_hooks_in.begin(), hook);
+		}
 
 		if (var.storage == StorageClassUniformConstant && !is_hidden_variable(var))
 		{
@@ -17582,6 +18002,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 					builtin_declaration = false;
 				});
 				break;
+			case BuiltInPointCoord:
+				if (get_execution_model() != ExecutionModelFragment || msl_options.point_coord_flip_buffer_index == ~0u)
+					break;
+
+				entry_func.fixup_hooks_in.push_back([=]() {
+					statement("if (spvPointCoordFlip != 0u)");
+					statement("    ", to_expression(var_id), ".y = 1.0 - ", to_expression(var_id), ".y;");
+				});
+				break;
 			case BuiltInBaseVertex:
 				// This is direct-mapped normally.
 				if (!msl_options.vertex_for_tessellation)
@@ -17760,6 +18189,12 @@ uint32_t CompilerMSL::get_metal_resource_index(SPIRVariable &var, SPIRType::Base
 		    type.basetype != SPIRType::AccelerationStructure)
 			binding_stride = 1;
 		// Allocate from plain bindings which are allocated per resource type.
+		// MGL: a plain uniform reached through the table takes a table entry
+		if (is_plain_uniform_in_table(var))
+		{
+			resource_index = next_plain_uniform_table_index++;
+		}
+		else
 		switch (basetype)
 		{
 		case SPIRType::Image:
@@ -19135,7 +19570,9 @@ string CompilerMSL::image_type_glsl(const SPIRType &type, uint32_t id, bool memb
 			img_type_4.vecsize = 4;
 			return type_to_glsl(img_type_4);
 		}
-		if (img_type.ms && (img_type.arrayed || subpass_array))
+		if (img_type.ms && img_type.sampled == 2 && msl_options.ms_storage_image_layers)
+			img_type_name += "texture2d_array";
+		else if (img_type.ms && (img_type.arrayed || subpass_array))
 		{
 			if (!msl_options.supports_msl_version(2, 1))
 				SPIRV_CROSS_THROW("Multisampled array textures are supported from 2.1.");
@@ -21363,6 +21800,8 @@ void CompilerMSL::cast_from_variable_load(uint32_t source_id, std::string &expr,
 	case BuiltInDrawIndex:
 	case BuiltInVertexIndex:
 	case BuiltInInstanceIndex:
+	case BuiltInVertexId:
+	case BuiltInInstanceId:
 	case BuiltInBaseInstance:
 	case BuiltInBaseVertex:
 	case BuiltInSampleMask:
@@ -21372,7 +21811,7 @@ void CompilerMSL::cast_from_variable_load(uint32_t source_id, std::string &expr,
 
 	case BuiltInTessLevelInner:
 	case BuiltInTessLevelOuter:
-		if (is_tesc_shader())
+		if (is_tesc_shader() && !msl_options.float_tess_factors)
 		{
 			expected_type = SPIRType::Half;
 			expected_width = 16;
@@ -21499,8 +21938,11 @@ void CompilerMSL::cast_to_variable_store(uint32_t target_id, std::string &expr, 
 
 	case BuiltInTessLevelInner:
 	case BuiltInTessLevelOuter:
-		expected_type = SPIRType::Half;
-		expected_width = 16;
+		if (!msl_options.float_tess_factors)
+		{
+			expected_type = SPIRType::Half;
+			expected_width = 16;
+		}
 		break;
 
 	default:
@@ -22589,6 +23031,10 @@ void CompilerMSL::emit_workgroup_initialization(const SPIRVariable &var)
 
 string CompilerMSL::additional_fixed_sample_mask_str() const
 {
+	// MGL: the mask is draw state
+	if (msl_options.sample_mask_buffer_index != ~0u && get_execution_model() == ExecutionModelFragment)
+		return "spvSampleMaskU";
+
 	char print_buffer[32];
 #ifdef _MSC_VER
 	// snprintf does not exist or is buggy on older MSVC versions, some of

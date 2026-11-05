@@ -644,8 +644,12 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 			chain = "(i == 2 ? z : w)";
 		std::string body = n == 2 ? "return i == 0 ? x : y;" :
 		                            "return i == 0 ? x : (i == 1 ? y : " + chain + ");";
-		e.line("    thread " + P + " &operator[](int i) { " + body + " }");
-		e.line("    const thread " + P + " &operator[](int i) const { " + body + " }");
+		// newer Metal compilers want the address space of 'this' spelled out
+		e.line("    thread " + P + " &operator[](int i) thread { " + body + " }");
+		e.line("    const thread " + P + " &operator[](int i) const thread { " + body + " }");
+		e.line("    device " + P + " &operator[](int i) device { " + body + " }");
+		e.line("    const device " + P + " &operator[](int i) const device { " + body + " }");
+		e.line("    const constant " + P + " &operator[](int i) const constant { " + body + " }");
 		e.line("};");
 	}
 	e.line("");
@@ -869,8 +873,11 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 				body = "return i == 0 ? c0 : (i == 1 ? c1 : c2);";
 			else
 				body = "return i == 0 ? c0 : (i == 1 ? c1 : (i == 2 ? c2 : c3));";
-			e.line("    thread " + V + " &operator[](int i) { " + body + " }");
-			e.line("    const thread " + V + " &operator[](int i) const { " + body + " }");
+			e.line("    thread " + V + " &operator[](int i) thread { " + body + " }");
+			e.line("    const thread " + V + " &operator[](int i) const thread { " + body + " }");
+			e.line("    device " + V + " &operator[](int i) device { " + body + " }");
+			e.line("    const device " + V + " &operator[](int i) const device { " + body + " }");
+			e.line("    const constant " + V + " &operator[](int i) const constant { " + body + " }");
 			e.line("};");
 		}
 	}
