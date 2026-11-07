@@ -1113,6 +1113,7 @@ protected:
 	void emit_local_masked_variable(const SPIRVariable &masked_var, bool strip_array);
 	void add_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref, SPIRType &ib_type,
 	                                     SPIRVariable &var, InterfaceBlockMeta &meta);
+	uint32_t fp64_high_attribute(uint32_t location);
 	void add_fp64_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
 	                                          SPIRType &ib_type, SPIRVariable &var, InterfaceBlockMeta &meta);
 	void add_composite_variable_to_interface_block(StorageClass storage, const std::string &ib_var_ref,
