@@ -8482,6 +8482,7 @@ std::string CompilerGLSL::to_texture_op(const Instruction &i, bool sparse, bool 
 			require_extension_internal("GL_EXT_samplerless_texture_functions");
 		// fallthrough
 	case OpImageRead: // Reads == fetches in Metal (other langs will not get here)
+	case OpImageSparseRead:
 		opt = &ops[4];
 		length -= 4;
 		fetch = true;
@@ -9974,7 +9975,9 @@ void CompilerGLSL::emit_subgroup_op(const Instruction &i)
 	const uint32_t *ops = stream(i);
 	auto op = static_cast<Op>(i.op);
 
-	if (!options.vulkan_semantics && !is_supported_subgroup_op_in_opengl(op, ops))
+	// GL_KHR_shader_subgroup brings every operation to desktop GL 4.6.
+	bool khr_in_gl = !options.es && options.version >= 460;
+	if (!options.vulkan_semantics && !khr_in_gl && !is_supported_subgroup_op_in_opengl(op, ops))
 		SPIRV_CROSS_THROW("This subgroup operation is only supported in Vulkan semantics.");
 
 	// If we need to do implicit bitcasts, make sure we do it with the correct type.

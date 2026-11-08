@@ -1797,6 +1797,11 @@ enum ExtendedDecorations
 	SPIRVCrossDecorationPaddingTarget,
 
 	SPIRVCrossDecorationInterfaceMemberIndex,
+
+	// Plus one, the element (or "row,col" as row * cols + col) of an array or
+	// matrix member that was flattened into this interface member.
+	SPIRVCrossDecorationInterfaceElement,
+	SPIRVCrossDecorationInterfaceElementColumns,
 	SPIRVCrossDecorationInterfaceOrigID,
 	SPIRVCrossDecorationResourceIndexPrimary,
 	// Used for decorations like resource indices for samplers when part of combined image samplers.

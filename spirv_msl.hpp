@@ -889,7 +889,10 @@ protected:
 		SPVFuncImplGatherSwizzle,
 		SPVFuncImplGatherCompareSwizzle,
 		SPVFuncImplGatherConstOffsets,
+		SPVFuncImplSparseResult,
+		SPVFuncImplSparseGatherConstOffsets,
 		SPVFuncImplGatherCompareConstOffsets,
+		SPVFuncImplSparseGatherCompareConstOffsets,
 		SPVFuncImplSubgroupBroadcast,
 		SPVFuncImplSubgroupBroadcastFirst,
 		SPVFuncImplSubgroupBallot,
@@ -903,6 +906,9 @@ protected:
 		SPVFuncImplSubgroupShuffleUp,
 		SPVFuncImplSubgroupShuffleDown,
 		SPVFuncImplSubgroupRotate,
+		SPVFuncImplSubgroupScan,
+		SPVFuncImplSubgroupLaneId,
+		SPVFuncImplSubgroupFloatReduce,
 		SPVFuncImplSubgroupClusteredAdd,
 		SPVFuncImplSubgroupClusteredFAdd = SPVFuncImplSubgroupClusteredAdd,
 		SPVFuncImplSubgroupClusteredIAdd = SPVFuncImplSubgroupClusteredAdd,
@@ -992,6 +998,11 @@ protected:
 	void emit_subgroup_cluster_op_cast(uint32_t result_type, uint32_t result_id, uint32_t cluster_size, uint32_t op0,
 	                                   const char *op, SPIRType::BaseType input_type,
 	                                   SPIRType::BaseType expected_result_type);
+	void emit_subgroup_scan_op(uint32_t result_type, uint32_t result_id, uint32_t op0, Op op, bool inclusive,
+	                           SPIRType::BaseType cast_type, uint32_t cluster_size = 0);
+	void emit_subgroup_float_op(uint32_t result_type, uint32_t result_id, uint32_t op0, const char *op);
+	bool subgroup_builtins_missing() const;
+	std::string interface_element_access(uint32_t type_id, uint32_t index) const;
 	std::string to_texture_op(const Instruction &i, bool sparse, bool *forward,
 	                          SmallVector<uint32_t> &inherited_expressions) override;
 	void emit_fixup() override;

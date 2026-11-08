@@ -33,6 +33,8 @@ const char *get_fp64_msl_prelude(FP64Mode mode);
 // The vector and matrix half of the prelude. Emitted right after the scalar
 // part, and only when the shader actually uses a dvec or a dmat.
 std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool want_matrices);
+// Subgroup functions for the emulated type, which Metal's own do not take.
+std::string get_fp64_subgroup_prelude(FP64Mode mode, bool want_vectors);
 
 // Name of the MSL type for a vecsize x columns emulated double.
 std::string get_fp64_composite_type_name(FP64Mode mode, uint32_t vecsize, uint32_t columns);

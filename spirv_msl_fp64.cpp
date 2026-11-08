@@ -1072,6 +1072,101 @@ std::string get_fp64_composite_prelude(FP64Mode mode, bool want_vectors, bool wa
 	return e.out;
 }
 
+std::string get_fp64_subgroup_prelude(FP64Mode mode, bool want_vectors)
+{
+	Emitter e;
+	e.P = get_fp64_type_name(mode);
+	const std::string &P = e.P;
+	std::vector<std::string> members;
+	if (mode == FP64Mode::TripleFloat)
+		members = { "x", "y", "z" };
+	else
+		members = { "hi", "lo" };
+
+	static const char *moves[] = { "simd_shuffle",      "simd_shuffle_xor",  "simd_shuffle_up",
+		                           "simd_shuffle_down", "simd_broadcast",    "simd_shuffle_rotate_down",
+		                           "quad_broadcast",    "quad_shuffle",      "quad_shuffle_xor",
+		                           "quad_shuffle_up",   "quad_shuffle_down", "quad_shuffle_rotate_down" };
+	static const char *firsts[] = { "simd_broadcast_first", "quad_broadcast_first" };
+
+	e.line("// ---- Subgroup functions ----");
+	for (auto *m : moves)
+	{
+		std::string s = "MGL_INL " + P + " " + m + "(" + P + " a, ushort i) { return " + P + "{";
+		for (size_t k = 0; k < members.size(); k++)
+			s += (k ? ", " : "") + std::string(m) + "(a." + members[k] + ", i)";
+		e.line(s + "}; }");
+	}
+	for (auto *m : firsts)
+	{
+		std::string s = "MGL_INL " + P + " " + m + "(" + P + " a) { return " + P + "{";
+		for (size_t k = 0; k < members.size(); k++)
+			s += (k ? ", " : "") + std::string(m) + "(a." + members[k] + ")";
+		e.line(s + "}; }");
+	}
+
+	e.line("MGL_INL bool operator==(" + P + " a, " + P + " b) { return " + e.call("eq", "a", "b") + "; }");
+	e.line("MGL_INL " + P + " operator+(" + P + " a, " + P + " b) { return " + e.add("a", "b") + "; }");
+	e.line("MGL_INL " + P + " operator*(" + P + " a, " + P + " b) { return " + e.mul("a", "b") + "; }");
+	e.line("MGL_INL " + P + " min(" + P + " a, " + P + " b) { return " + e.call("min", "a", "b") + "; }");
+	e.line("MGL_INL " + P + " max(" + P + " a, " + P + " b) { return " + e.call("max", "a", "b") + "; }");
+	e.line("template<typename T> T spvFp64Splat(float f);");
+	e.line("template<> __attribute__((always_inline)) inline " + P + " spvFp64Splat<" + P + ">(float f) { return " + P + "_from_float(f); }");
+
+	// In lane order from the identity, the way a shader loop would add them.
+	struct Reduce { const char *name, *ident, *op; };
+	static const Reduce reduces[] = { { "sum", "0.0f", "+" }, { "product", "1.0f", "*" },
+		                              { "min", "INFINITY", "min" }, { "max", "-INFINITY", "max" } };
+	for (auto &r : reduces)
+	{
+		bool fn = r.op[0] == 'm';
+		e.line("MGL_INL " + P + " simd_" + r.name + "(" + P + " a)");
+		e.line("{");
+		e.line("    ulong mask = ulong(simd_active_threads_mask());");
+		e.line("    " + P + " r = " + P + "_from_float(" + r.ident + ");");
+		e.line("    for (ushort j = 0; j < 64; j++)");
+		e.line("    {");
+		e.line("        " + P + " s = simd_shuffle(a, j);");
+		e.line("        if (((mask >> j) & 1ul) != 0)");
+		e.line(std::string("            r = ") + (fn ? std::string(r.op) + "(r, s)" : "r " + std::string(r.op) + " s") +
+		       ";");
+		e.line("    }");
+		e.line("    return r;");
+		e.line("}");
+	}
+
+	if (want_vectors)
+	{
+		for (uint32_t n = 2; n <= 4; n++)
+		{
+			const std::string V = e.vec(n);
+			auto each = [&](const std::string &head, const std::string &fn, const std::string &args) {
+				std::vector<std::string> parts;
+				for (uint32_t i = 0; i < n; i++)
+					parts.push_back(fn + "(" + e.at("a", i, n) + args + ")");
+				e.line("MGL_INL " + V + " " + head + " { return " + e.build(n, parts) + "; }");
+			};
+			for (auto *m : moves)
+				each(std::string(m) + "(" + V + " a, ushort i)", m, ", i");
+			for (auto *m : firsts)
+				each(std::string(m) + "(" + V + " a)", m, "");
+			for (auto &r : reduces)
+				each(std::string("simd_") + r.name + "(" + V + " a)", std::string("simd_") + r.name, "");
+			e.line("MGL_INL bool" + std::to_string(n) + " operator==(" + V + " a, " + V + " b) { return " +
+			       e.call("eq", "a", "b") + "; }");
+			e.line("MGL_INL " + V + " operator+(" + V + " a, " + V + " b) { return " + e.add("a", "b") + "; }");
+			e.line("MGL_INL " + V + " operator*(" + V + " a, " + V + " b) { return " + e.mul("a", "b") + "; }");
+			e.line("MGL_INL " + V + " min(" + V + " a, " + V + " b) { return " + e.call("min", "a", "b") + "; }");
+			e.line("MGL_INL " + V + " max(" + V + " a, " + V + " b) { return " + e.call("max", "a", "b") + "; }");
+			std::vector<std::string> parts(n, P + "_from_float(f)");
+			e.line("template<> __attribute__((always_inline)) inline " + V + " spvFp64Splat<" + V + ">(float f) { return " + e.build(n, parts) +
+			       "; }");
+		}
+	}
+	e.line("");
+	return e.out;
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1104,12 +1199,24 @@ const char *get_fp64_type_name(FP64Mode mode)
 
 void split_double_df(double value, float &hi, float &lo)
 {
+	if (!std::isfinite(value))
+	{
+		hi = static_cast<float>(value);
+		lo = 0.0f;
+		return;
+	}
 	hi = static_cast<float>(value);
 	lo = static_cast<float>(value - static_cast<double>(hi));
 }
 
 void split_double_tf(double value, float &x, float &y, float &z)
 {
+	if (!std::isfinite(value))
+	{
+		x = static_cast<float>(value);
+		y = z = 0.0f;
+		return;
+	}
 	x = static_cast<float>(value);
 	double remainder = value - static_cast<double>(x);
 	y = static_cast<float>(remainder);

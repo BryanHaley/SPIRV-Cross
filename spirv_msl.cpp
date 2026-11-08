@@ -2346,6 +2346,12 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 				break;
 			}
 
+			case OpGroupNonUniformShuffleXor:
+			case OpGroupNonUniformShuffleUp:
+			case OpGroupNonUniformShuffleDown:
+				added_arg_ids.insert(builtin_subgroup_invocation_id_id);
+				break;
+
 			case OpGroupNonUniformRotateKHR:
 			{
 				// Add the correct invocation ID for calculating clustered rotate case.
@@ -2371,8 +2377,9 @@ void CompilerMSL::extract_global_variables_from_function(uint32_t func_id, std::
 			case OpGroupNonUniformLogicalAnd:
 			case OpGroupNonUniformLogicalOr:
 			case OpGroupNonUniformLogicalXor:
-				if ((get_execution_model() != ExecutionModelFragment || msl_options.supports_msl_version(2, 2)) &&
-				    ops[3] == GroupOperationClusteredReduce)
+				if (((get_execution_model() != ExecutionModelFragment || msl_options.supports_msl_version(2, 2)) &&
+				     ops[3] == GroupOperationClusteredReduce) ||
+				    ops[3] == GroupOperationInclusiveScan || ops[3] == GroupOperationExclusiveScan)
 					added_arg_ids.insert(builtin_subgroup_invocation_id_id);
 				break;
 
@@ -3815,6 +3822,12 @@ void CompilerMSL::add_composite_member_variable_to_interface_block(StorageClass 
 		string idx_str = mbr_mat_cols ? join("_", i / mbr_mat_cols, "_", i % mbr_mat_cols) : join("_", i);
 		string mbr_name = ensure_valid_name(append_member_name(mbr_name_qual, var_type, mbr_idx) + (mbr_is_indexable ? idx_str : ""), "m");
 		set_member_name(ib_type.self, ib_mbr_idx, mbr_name);
+		if (mbr_is_indexable)
+		{
+			set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceElement, i + 1);
+			set_extended_member_decoration(ib_type.self, ib_mbr_idx, SPIRVCrossDecorationInterfaceElementColumns,
+			                               mbr_mat_cols);
+		}
 
 		// The SPIRV location of interface variable, used to obtain the initial
 		// MSL location (the location variable) and interface matching
@@ -4414,6 +4427,13 @@ void CompilerMSL::emit_local_masked_variable(const SPIRVariable &masked_var, boo
 	{
 		entry_func.add_local_variable(masked_var.self);
 	}
+
+	// Uses of a builtin are spelled by builtin_to_glsl, so the local has to
+	// carry that name rather than the sanitized one.
+	if (has_decoration(masked_var.self, DecorationBuiltIn) && !threadgroup_storage)
+		ir.meta[masked_var.self].decoration.alias =
+		    CompilerGLSL::builtin_to_glsl(BuiltIn(get_decoration(masked_var.self, DecorationBuiltIn)),
+		                                  StorageClassOutput);
 
 	if (!threadgroup_storage)
 	{
@@ -6993,6 +7013,15 @@ std::string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint3
 		// Each component is its own struct of floats, and a vector of them is a
 		// struct again. Writing only the first component left a dvec3 declared
 		// as a scalar.
+		auto lit = [](float f) {
+			char b[64];
+			if (std::isnan(f))
+				return std::string("NAN");
+			if (std::isinf(f))
+				return std::string(f < 0.0f ? "-INFINITY" : "INFINITY");
+			snprintf(b, sizeof(b), "%.9e", f);
+			return std::string(b);
+		};
 		auto scalar = [&](uint32_t row) {
 			double value = c.scalar_f64(vector, row);
 			char buf[256];
@@ -7001,15 +7030,15 @@ std::string CompilerMSL::constant_expression_vector(const SPIRConstant &c, uint3
 			{
 				float x, y, z;
 				split_double_tf(value, x, y, z);
-				snprintf(buf, sizeof(buf), "%s{%.9e, %.9e, %.9e}",
-				         get_fp64_type_name(msl_options.fp64_mode), x, y, z);
+				snprintf(buf, sizeof(buf), "%s{%s, %s, %s}", get_fp64_type_name(msl_options.fp64_mode),
+				         lit(x).c_str(), lit(y).c_str(), lit(z).c_str());
 			}
 			else
 			{
 				float x, y;
 				split_double_df(value, x, y);
-				snprintf(buf, sizeof(buf), "%s{%.9e, %.9e}",
-				         get_fp64_type_name(msl_options.fp64_mode), x, y);
+				snprintf(buf, sizeof(buf), "%s{%s, %s}", get_fp64_type_name(msl_options.fp64_mode),
+				         lit(x).c_str(), lit(y).c_str());
 			}
 
 			return std::string(buf);
@@ -7052,6 +7081,10 @@ void CompilerMSL::emit_custom_functions()
 		statement(get_fp64_msl_prelude(msl_options.fp64_mode));
 		statement(get_fp64_composite_prelude(msl_options.fp64_mode, module_uses_fp64_composite,
 		                                     module_uses_fp64_matrix));
+		if (ir.get_spirv_version() >= 0x10300 &&
+		    std::find(ir.declared_capabilities.begin(), ir.declared_capabilities.end(), CapabilityGroupNonUniform) !=
+		        ir.declared_capabilities.end())
+			statement(get_fp64_subgroup_prelude(msl_options.fp64_mode, module_uses_fp64_composite));
 		statement("");
 	}
 
@@ -7082,15 +7115,23 @@ void CompilerMSL::emit_custom_functions()
 	}
 
 	if (spv_function_implementations.count(SPVFuncImplGatherSwizzle) ||
-	    spv_function_implementations.count(SPVFuncImplGatherConstOffsets))
+	    spv_function_implementations.count(SPVFuncImplGatherConstOffsets) ||
+	    spv_function_implementations.count(SPVFuncImplSparseGatherConstOffsets))
 	{
 		spv_function_implementations.insert(SPVFuncImplGatherReturn);
 	}
 
 	if (spv_function_implementations.count(SPVFuncImplGatherCompareSwizzle) ||
-	    spv_function_implementations.count(SPVFuncImplGatherCompareConstOffsets))
+	    spv_function_implementations.count(SPVFuncImplGatherCompareConstOffsets) ||
+	    spv_function_implementations.count(SPVFuncImplSparseGatherCompareConstOffsets))
 	{
 		spv_function_implementations.insert(SPVFuncImplGatherCompareReturn);
+	}
+
+	if (spv_function_implementations.count(SPVFuncImplSparseGatherConstOffsets) ||
+	    spv_function_implementations.count(SPVFuncImplSparseGatherCompareConstOffsets))
+	{
+		spv_function_implementations.insert(SPVFuncImplSparseResult);
 	}
 
 	if (spv_function_implementations.count(SPVFuncImplTextureSwizzle) ||
@@ -7844,6 +7885,51 @@ void CompilerMSL::emit_custom_functions()
 			}
 			break;
 
+		case SPVFuncImplSparseResult:
+			statement("template<typename T>");
+			statement("struct spvSparseResult");
+			begin_scope();
+			statement("T v;");
+			statement("bool r;");
+			statement("bool resident() const thread { return r; }");
+			statement("T value() const thread { return v; }");
+			end_scope_decl();
+			statement("");
+			break;
+
+		case SPVFuncImplSparseGatherConstOffsets:
+			// The same four gathers, sparse, resident only if all four were
+			for (uint32_t i = 0; i < texture_addr_space_count; i++)
+			{
+				statement("template<typename Tex, typename Toff, typename... Tp>");
+				statement("inline spvSparseResult<spvGatherReturn<Tex, Tp...>> spvSparseGatherConstOffsets(const ",
+				          texture_addr_spaces[i], " Tex& t, sampler s, Toff coffsets, component c, Tp... params) "
+				          "METAL_CONST_ARG(c)");
+				begin_scope();
+				statement("spvGatherReturn<Tex, Tp...> rslts[4];");
+				statement("bool r = true;");
+				statement("for (uint i = 0; i < 4; i++)");
+				begin_scope();
+				statement("switch (c)");
+				begin_scope();
+				for (const char *comp : { "x", "y", "z", "w" })
+				{
+					statement("case component::", comp, ":");
+					begin_scope();
+					statement("auto g = t.sparse_gather(s, params..., coffsets[i], component::", comp, ");");
+					statement("r = r && g.resident();");
+					statement("rslts[i] = g.value();");
+					statement("break;");
+					end_scope();
+				}
+				end_scope();
+				end_scope();
+				statement("return { spvGatherReturn<Tex, Tp...>(rslts[0].w, rslts[1].w, rslts[2].w, rslts[3].w), r };");
+				end_scope();
+				statement("");
+			}
+			break;
+
 		case SPVFuncImplGatherCompareConstOffsets:
 			// Because we are passing a texture reference, we have to output an overloaded version of this function for each address space.
 			for (uint32_t i = 0; i < texture_addr_space_count; i++)
@@ -7860,6 +7946,27 @@ void CompilerMSL::emit_custom_functions()
 				end_scope();
 				// Pull all values from the i0j0 component of each gather footprint
 				statement("return spvGatherCompareReturn<Tex, Tp...>(rslts[0].w, rslts[1].w, rslts[2].w, rslts[3].w);");
+				end_scope();
+				statement("");
+			}
+			break;
+
+		case SPVFuncImplSparseGatherCompareConstOffsets:
+			for (uint32_t i = 0; i < texture_addr_space_count; i++)
+			{
+				statement("template<typename Tex, typename Toff, typename... Tp>");
+				statement("inline spvSparseResult<spvGatherCompareReturn<Tex, Tp...>> spvSparseGatherCompareConstOffsets(const ",
+				          texture_addr_spaces[i], " Tex& t, sampler s, Toff coffsets, Tp... params)");
+				begin_scope();
+				statement("spvGatherCompareReturn<Tex, Tp...> rslts[4];");
+				statement("bool r = true;");
+				statement("for (uint i = 0; i < 4; i++)");
+				begin_scope();
+				statement("auto g = t.sparse_gather_compare(s, params..., coffsets[i]);");
+				statement("r = r && g.resident();");
+				statement("rslts[i] = g.value();");
+				end_scope();
+				statement("return { spvGatherCompareReturn<Tex, Tp...>(rslts[0].w, rslts[1].w, rslts[2].w, rslts[3].w), r };");
 				end_scope();
 				statement("");
 			}
@@ -8150,92 +8257,169 @@ void CompilerMSL::emit_custom_functions()
 
 		case SPVFuncImplSubgroupShuffleXor:
 			statement("template<typename T>");
-			statement("inline T spvSubgroupShuffleXor(T value, ushort mask)");
+			statement("inline T spvSubgroupShuffleXor(T value, ushort mask, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return quad_shuffle_xor(value, mask);");
 			else
-				statement("return simd_shuffle_xor(value, mask);");
+				statement("return simd_shuffle(value, ushort(lid ^ mask));");
 			end_scope();
 			statement("");
 			statement("template<>");
-			statement("inline bool spvSubgroupShuffleXor(bool value, ushort mask)");
+			statement("inline bool spvSubgroupShuffleXor(bool value, ushort mask, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return !!quad_shuffle_xor((ushort)value, mask);");
 			else
-				statement("return !!simd_shuffle_xor((ushort)value, mask);");
+				statement("return !!simd_shuffle((ushort)value, ushort(lid ^ mask));");
 			end_scope();
 			statement("");
 			statement("template<uint N>");
-			statement("inline vec<bool, N> spvSubgroupShuffleXor(vec<bool, N> value, ushort mask)");
+			statement("inline vec<bool, N> spvSubgroupShuffleXor(vec<bool, N> value, ushort mask, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return (vec<bool, N>)quad_shuffle_xor((vec<ushort, N>)value, mask);");
 			else
-				statement("return (vec<bool, N>)simd_shuffle_xor((vec<ushort, N>)value, mask);");
+				statement("return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, ushort(lid ^ mask));");
 			end_scope();
 			statement("");
 			break;
 
 		case SPVFuncImplSubgroupShuffleUp:
 			statement("template<typename T>");
-			statement("inline T spvSubgroupShuffleUp(T value, ushort delta)");
+			statement("inline T spvSubgroupShuffleUp(T value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return quad_shuffle_up(value, delta);");
 			else
-				statement("return simd_shuffle_up(value, delta);");
+				statement("return simd_shuffle(value, ushort(lid - delta));");
 			end_scope();
 			statement("");
 			statement("template<>");
-			statement("inline bool spvSubgroupShuffleUp(bool value, ushort delta)");
+			statement("inline bool spvSubgroupShuffleUp(bool value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return !!quad_shuffle_up((ushort)value, delta);");
 			else
-				statement("return !!simd_shuffle_up((ushort)value, delta);");
+				statement("return !!simd_shuffle((ushort)value, ushort(lid - delta));");
 			end_scope();
 			statement("");
 			statement("template<uint N>");
-			statement("inline vec<bool, N> spvSubgroupShuffleUp(vec<bool, N> value, ushort delta)");
+			statement("inline vec<bool, N> spvSubgroupShuffleUp(vec<bool, N> value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return (vec<bool, N>)quad_shuffle_up((vec<ushort, N>)value, delta);");
 			else
-				statement("return (vec<bool, N>)simd_shuffle_up((vec<ushort, N>)value, delta);");
+				statement("return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, ushort(lid - delta));");
 			end_scope();
 			statement("");
 			break;
 
 		case SPVFuncImplSubgroupShuffleDown:
 			statement("template<typename T>");
-			statement("inline T spvSubgroupShuffleDown(T value, ushort delta)");
+			statement("inline T spvSubgroupShuffleDown(T value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return quad_shuffle_down(value, delta);");
 			else
-				statement("return simd_shuffle_down(value, delta);");
+				statement("return simd_shuffle(value, ushort(lid + delta));");
 			end_scope();
 			statement("");
 			statement("template<>");
-			statement("inline bool spvSubgroupShuffleDown(bool value, ushort delta)");
+			statement("inline bool spvSubgroupShuffleDown(bool value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return !!quad_shuffle_down((ushort)value, delta);");
 			else
-				statement("return !!simd_shuffle_down((ushort)value, delta);");
+				statement("return !!simd_shuffle((ushort)value, ushort(lid + delta));");
 			end_scope();
 			statement("");
 			statement("template<uint N>");
-			statement("inline vec<bool, N> spvSubgroupShuffleDown(vec<bool, N> value, ushort delta)");
+			statement("inline vec<bool, N> spvSubgroupShuffleDown(vec<bool, N> value, ushort delta, ushort lid)");
 			begin_scope();
 			if (msl_options.use_quadgroup_operation())
 				statement("return (vec<bool, N>)quad_shuffle_down((vec<ushort, N>)value, delta);");
 			else
-				statement("return (vec<bool, N>)simd_shuffle_down((vec<ushort, N>)value, delta);");
+				statement("return (vec<bool, N>)simd_shuffle((vec<ushort, N>)value, ushort(lid + delta));");
 			end_scope();
 			statement("");
+			break;
+
+		case SPVFuncImplSubgroupScan:
+			// Metal only scans sums and products. The rest walk the active
+			// lanes below this one; every lane runs every shuffle.
+			statement("struct spvScanMin { template<typename T> static T op(T a, T b) { return min(a, b); } };");
+			statement("struct spvScanMax { template<typename T> static T op(T a, T b) { return max(a, b); } };");
+			statement("struct spvScanAnd { template<typename T> static T op(T a, T b) { return a & b; } };");
+			statement("struct spvScanOr { template<typename T> static T op(T a, T b) { return a | b; } };");
+			statement("struct spvScanXor { template<typename T> static T op(T a, T b) { return a ^ b; } };");
+			statement("struct spvScanAdd { template<typename T> static T op(T a, T b) { return a + b; } };");
+			statement("struct spvScanMul { template<typename T> static T op(T a, T b) { return a * b; } };");
+			statement("");
+			statement("template<typename Op, typename T>");
+			statement("__attribute__((noinline)) T spvSubgroupClusterReduce(T value, T identity, uint lid, uint size)");
+			begin_scope();
+			statement("ulong mask = ulong(simd_active_threads_mask());");
+			statement("T r = identity;");
+			statement("for (ushort j = 0; j < 64; j++)");
+			begin_scope();
+			statement("T s = simd_shuffle(value, j);");
+			statement("if ((j & ~(size - 1)) == (lid & ~(size - 1)) && ((mask >> j) & 1ul) != 0)");
+			statement("    r = Op::op(r, s);");
+			end_scope();
+			statement("return r;");
+			end_scope();
+			statement("");
+			statement("template<typename Op, typename T>");
+			statement("__attribute__((noinline)) T spvSubgroupScan(T value, T identity, uint lid, bool inclusive)");
+			begin_scope();
+			statement("ulong mask = ulong(simd_active_threads_mask());");
+			statement("T r = identity;");
+			statement("for (ushort j = 0; j < 64; j++)");
+			begin_scope();
+			statement("T s = simd_shuffle(value, j);");
+			statement("if ((j < lid || (inclusive && j == lid)) && ((mask >> j) & 1ul) != 0)");
+			statement("    r = Op::op(r, s);");
+			end_scope();
+			statement("return r;");
+			end_scope();
+			statement("");
+			break;
+
+		case SPVFuncImplSubgroupLaneId:
+			// The active lanes at entry, counted from the bottom of the ballot.
+			statement("inline uint spvSubgroupLaneId()");
+			begin_scope();
+			statement("ulong mask = ulong(simd_ballot(true));");
+			statement("uint rank = simd_prefix_exclusive_sum(1u);");
+			statement("for (uint j = 0; j < 64; j++)");
+			begin_scope();
+			statement("if (((mask >> j) & 1ul) != 0)");
+			begin_scope();
+			statement("if (rank == 0)");
+			statement("    return j;");
+			statement("rank--;");
+			end_scope();
+			end_scope();
+			statement("return 0;");
+			end_scope();
+			statement("");
+			break;
+
+		case SPVFuncImplSubgroupFloatReduce:
+			// The Metal compiler merges a float reduction inside a branch with
+			// the same one before it, so the inactive lanes leak in. A call it
+			// cannot see into keeps them apart.
+			for (const char *f : { "sum", "product", "min", "max", "prefix_inclusive_sum",
+			                       "prefix_exclusive_sum", "prefix_inclusive_product", "prefix_exclusive_product" })
+			{
+				statement("template<typename T>");
+				statement("__attribute__((noinline)) T spvSimd_", f, "(T value)");
+				begin_scope();
+				statement("return simd_", f, "(value);");
+				end_scope();
+				statement("");
+			}
 			break;
 
 		case SPVFuncImplSubgroupRotate:
@@ -8346,7 +8530,7 @@ void CompilerMSL::emit_custom_functions()
 			end_scope_decl(); \
 			statement(""); \
 			statement("template<uint N, typename T>"); \
-			statement("T spvClustered_" #msl "(T value, uint lid)"); \
+			statement("__attribute__((noinline)) T spvClustered_" #msl "(T value, uint lid)"); \
 			begin_scope(); \
 			statement("return spvClustered" #spv "Detail<N, 0>::op(value, lid);"); \
 			end_scope(); \
@@ -11387,6 +11571,23 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		break;
 	}
 
+	case OpImageSparseRead:
+	{
+		auto *p_var = maybe_get_backing_variable(ops[2]);
+		if (p_var && has_decoration(p_var->self, DecorationNonReadable))
+		{
+			unset_decoration(p_var->self, DecorationNonReadable);
+			force_recompile();
+		}
+		emit_texture_op(instruction, true);
+		break;
+	}
+
+	case OpImageSparseTexelsResident:
+		emit_op(ops[0], ops[1], join("(", to_enclosed_expression(ops[2]), " == 0)"), should_forward(ops[2]));
+		inherit_expression_dependencies(ops[1], ops[2]);
+		break;
+
 	case OpImageQuerySize:
 	case OpImageQuerySizeLod:
 	{
@@ -12505,8 +12706,33 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 
 void CompilerMSL::emit_texture_op(const Instruction &i, bool sparse)
 {
+	// The SPIR-V result is a residency code and the texel. Metal hands back a
+	// sparse_color holding both; a code of zero means resident.
 	if (sparse)
-		SPIRV_CROSS_THROW("Sparse feedback not yet supported in MSL.");
+	{
+		auto *ops = stream(i);
+		uint32_t result_type_id = ops[0];
+		uint32_t id = ops[1];
+		auto &return_type = get<SPIRType>(result_type_id);
+
+		if (return_type.basetype != SPIRType::Struct || return_type.member_types.size() != 2)
+			SPIRV_CROSS_THROW("Invalid return type for sparse feedback.");
+
+		SmallVector<uint32_t> inherited_expressions;
+		bool forward = false;
+		string expr = to_texture_op(i, true, &forward, inherited_expressions);
+		string tmp = join("_", id, "_sparse");
+		auto &texel_type = get<SPIRType>(return_type.member_types[1]);
+
+		statement("auto ", tmp, " = ", expr, ";");
+		emit_op(result_type_id, id,
+		        join(type_to_glsl(return_type), "{ int(!", tmp, ".resident()), ", type_to_glsl(texel_type), "(",
+		             tmp, ".value()) }"),
+		        false);
+		for (auto &inherit : inherited_expressions)
+			inherit_expression_dependencies(id, inherit);
+		return;
+	}
 
 	if (msl_options.use_framebuffer_fetch_subpasses)
 	{
@@ -14047,6 +14273,12 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
 	    (!constexpr_sampler || !constexpr_sampler->ycbcr_conversion_enable))
 	{
 		bool is_compare = args.has_dref;
+		if (args.is_sparse_feedback)
+		{
+			add_spv_func_and_recompile(is_compare ? SPVFuncImplSparseGatherCompareConstOffsets :
+			                                        SPVFuncImplSparseGatherConstOffsets);
+			return is_compare ? "spvSparseGatherCompareConstOffsets" : "spvSparseGatherConstOffsets";
+		}
 		add_spv_func_and_recompile(is_compare ? SPVFuncImplGatherCompareConstOffsets : SPVFuncImplGatherConstOffsets);
 		return is_compare ? "spvGatherCompareConstOffsets" : "spvGatherConstOffsets";
 	}
@@ -14173,6 +14405,10 @@ string CompilerMSL::to_function_name(const TextureFunctionNameArguments &args)
 		}
 
 		fname = img_expr + ".";
+
+		// a sparse lookup returns a sparse_color that also says if it was resident
+		if (args.is_sparse_feedback)
+			fname += "sparse_";
 
 		// Texture function and sampler
 		if (args.base.is_fetch)
@@ -14533,6 +14769,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		}
 	}
 
+	bool dref_zero_grad = false;
 	// Depth compare reference value
 	if (args.dref)
 	{
@@ -14567,7 +14804,12 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 				lod = 0;
 				grad_x = 0;
 				grad_y = 0;
-				farg_str += ", level(0)";
+				// MGL: zero gradients mean the lowest LOD, so only the clamp applies
+				dref_zero_grad = true;
+				if (args.min_lod)
+					farg_str += ", level(" + to_unpacked_expression(args.min_lod) + ")";
+				else
+					farg_str += ", level(0)";
 			}
 			else if (!msl_options.supports_msl_version(2, 3))
 			{
@@ -14595,7 +14837,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 	// MGL: GL adds the texture's LOD bias to every level of detail, implicit or
 	// given; outside the fragment stage an implicit one starts at level 0
 	string tex_bias;
-	if (!grad_x && !args.base.is_fetch && !args.base.is_gather && imgtype.image.dim != DimBuffer &&
+	if (!grad_x && !dref_zero_grad && !args.base.is_fetch && !args.base.is_gather && imgtype.image.dim != DimBuffer &&
 	    !imgtype.image.ms && (imgtype.image.dim != Dim1D || msl_options.texture_1D_as_2D))
 	{
 		string param = texture_param_expression(img);
@@ -14717,6 +14959,8 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		{
 		case Dim1D:
 		case Dim2D:
+		// MODIFIED (The Moogle Project): a rectangle is a 2D texture to Metal
+		case DimRect:
 			grad_opt = "gradient2d";
 			break;
 		case Dim3D:
@@ -14745,7 +14989,7 @@ string CompilerMSL::to_function_args(const TextureFunctionArguments &args, bool 
 		farg_str += join(", ", grad_opt, "(", grad_coord, to_unpacked_expression(grad_x), ", ", to_unpacked_expression(grad_y), ")");
 	}
 
-	if (args.min_lod)
+	if (args.min_lod && !dref_zero_grad)
 	{
 		if (!msl_options.supports_msl_version(2, 2))
 			SPIRV_CROSS_THROW("min_lod_clamp() is only supported in MSL 2.2+ and up.");
@@ -15017,7 +15261,7 @@ string CompilerMSL::to_texture_op(const Instruction &i, bool sparse, bool *forwa
 		}
 	}
 	else if (msl_options.swizzle_texture_samples && !is_gather && is_sampled_image_type(imgtype) &&
-	         !is_dynamic_img_sampler)
+	         !is_dynamic_img_sampler && !sparse)
 	{
 		add_spv_func_and_recompile(SPVFuncImplTextureSwizzle);
 		expr += "spvTextureSwizzle(";
@@ -16653,6 +16897,15 @@ string CompilerMSL::entry_point_arg_stage_in()
 
 // Returns true if this input builtin should be a direct parameter on a shader function parameter list,
 // and false for builtins that should be passed or calculated some other way.
+// A vertex function can call the SIMD-group functions but has no inputs for
+// its lane or the group's width.
+bool CompilerMSL::subgroup_builtins_missing() const
+{
+	auto model = get_execution_model();
+	return (model == ExecutionModelVertex && !msl_options.vertex_for_tessellation) ||
+	       model == ExecutionModelTessellationEvaluation;
+}
+
 bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
 {
 	switch (bi_type)
@@ -16701,11 +16954,11 @@ bool CompilerMSL::is_direct_input_builtin(BuiltIn bi_type)
 	case BuiltInSubgroupLtMask:
 		return false;
 	case BuiltInSubgroupSize:
-		if (msl_options.fixed_subgroup_size != 0)
+		if (msl_options.fixed_subgroup_size != 0 || subgroup_builtins_missing())
 			return false;
 		/* fallthrough */
 	case BuiltInSubgroupLocalInvocationId:
-		return !msl_options.emulate_subgroups;
+		return !msl_options.emulate_subgroups && !subgroup_builtins_missing();
 	case BuiltInDrawIndex:
 		// Emulated
 		return false;
@@ -17763,6 +18016,15 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				});
 				break;
 			case BuiltInSubgroupLocalInvocationId:
+				if (subgroup_builtins_missing())
+				{
+					add_spv_func_and_recompile(SPVFuncImplSubgroupLaneId);
+					// first, since the subgroup masks are built from it
+					entry_func.fixup_hooks_in.insert(entry_func.fixup_hooks_in.begin(), [=]() {
+						statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = spvSubgroupLaneId();");
+					});
+					break;
+				}
 				if (!msl_options.emulate_subgroups)
 					break;
 				// For subgroup emulation, assume subgroups of size 1.
@@ -17770,7 +18032,13 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				    [=]() { statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = 0;"); });
 				break;
 			case BuiltInSubgroupSize:
-				if (msl_options.emulate_subgroups)
+				if (subgroup_builtins_missing() && msl_options.fixed_subgroup_size == 0 && !msl_options.emulate_subgroups)
+				{
+					// Apple GPUs run every stage 32 wide.
+					entry_func.fixup_hooks_in.insert(entry_func.fixup_hooks_in.begin(),
+					    [=]() { statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = 32;"); });
+				}
+				else if (msl_options.emulate_subgroups)
 				{
 					// For subgroup emulation, assume subgroups of size 1.
 					entry_func.fixup_hooks_in.push_back(
@@ -18139,9 +18407,11 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				});
 				break;
 			case BuiltInDrawIndex:
+				// in the variable's own type, which a function taking it by
+				// reference has to match
 				entry_func.fixup_hooks_in.push_back([=]() {
-					statement(builtin_type_decl(bi_type), " ", to_expression(var_id), " = *",
-					          to_expression(draw_index_buffer_id), ";");
+					string t = type_to_glsl(get_variable_data_type(get<SPIRVariable>(var_id)));
+					statement(t, " ", to_expression(var_id), " = ", t, "(*", to_expression(draw_index_buffer_id), ");");
 				});
 				break;
 			default:
@@ -19940,15 +20210,18 @@ void CompilerMSL::emit_subgroup_op(const Instruction &i)
 		break;
 
 	case OpGroupNonUniformShuffleXor:
-		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupShuffleXor");
+		emit_trinary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], builtin_subgroup_invocation_id_id,
+		                     "spvSubgroupShuffleXor");
 		break;
 
 	case OpGroupNonUniformShuffleUp:
-		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupShuffleUp");
+		emit_trinary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], builtin_subgroup_invocation_id_id,
+		                     "spvSubgroupShuffleUp");
 		break;
 
 	case OpGroupNonUniformShuffleDown:
-		emit_binary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], "spvSubgroupShuffleDown");
+		emit_trinary_func_op(result_type, id, ops[op_idx], ops[op_idx + 1], builtin_subgroup_invocation_id_id,
+		                     "spvSubgroupShuffleDown");
 		break;
 
 	case OpGroupNonUniformRotateKHR:
@@ -19995,17 +20268,22 @@ case OpGroupNonUniform##op: \
 	{ \
 		auto operation = static_cast<GroupOperation>(ops[op_idx++]); \
 		if (operation == GroupOperationReduce) \
-			emit_unary_func_op(result_type, id, ops[op_idx], "simd_" #msl_op); \
+			emit_subgroup_float_op(result_type, id, ops[op_idx], #msl_op); \
 		else if (operation == GroupOperationInclusiveScan) \
-			emit_unary_func_op(result_type, id, ops[op_idx], "simd_prefix_inclusive_" #msl_op); \
+			emit_subgroup_float_op(result_type, id, ops[op_idx], "prefix_inclusive_" #msl_op); \
 		else if (operation == GroupOperationExclusiveScan) \
-			emit_unary_func_op(result_type, id, ops[op_idx], "simd_prefix_exclusive_" #msl_op); \
+			emit_subgroup_float_op(result_type, id, ops[op_idx], "prefix_exclusive_" #msl_op); \
 		else if (operation == GroupOperationClusteredReduce) \
 		{ \
 			uint32_t cluster_size = evaluate_constant_u32(ops[op_idx + 1]); \
 			if (get_execution_model() != ExecutionModelFragment || msl_options.supports_msl_version(2, 2)) \
 				add_spv_func_and_recompile(SPVFuncImplSubgroupClustered##op); \
-			emit_subgroup_cluster_op(result_type, id, cluster_size, ops[op_idx], #msl_op); \
+			if (get<SPIRType>(result_type).basetype == SPIRType::Double || \
+			    get<SPIRType>(result_type).basetype == SPIRType::Float) \
+				emit_subgroup_scan_op(result_type, id, ops[op_idx], OpGroupNonUniform##op, false, \
+				                      SPIRType::Unknown, cluster_size); \
+			else \
+				emit_subgroup_cluster_op(result_type, id, cluster_size, ops[op_idx], #msl_op); \
 		} \
 		else \
 			SPIRV_CROSS_THROW("Invalid group operation."); \
@@ -20023,17 +20301,21 @@ case OpGroupNonUniform##op: \
 	{ \
 		auto operation = static_cast<GroupOperation>(ops[op_idx++]); \
 		if (operation == GroupOperationReduce) \
-			emit_unary_func_op(result_type, id, ops[op_idx], "simd_" #msl_op); \
-		else if (operation == GroupOperationInclusiveScan) \
-			SPIRV_CROSS_THROW("Metal doesn't support InclusiveScan for OpGroupNonUniform" #op "."); \
-		else if (operation == GroupOperationExclusiveScan) \
-			SPIRV_CROSS_THROW("Metal doesn't support ExclusiveScan for OpGroupNonUniform" #op "."); \
+			emit_subgroup_float_op(result_type, id, ops[op_idx], #msl_op); \
+		else if (operation == GroupOperationInclusiveScan || operation == GroupOperationExclusiveScan) \
+			emit_subgroup_scan_op(result_type, id, ops[op_idx], OpGroupNonUniform##op, \
+			                      operation == GroupOperationInclusiveScan, SPIRType::Unknown); \
 		else if (operation == GroupOperationClusteredReduce) \
 		{ \
 			uint32_t cluster_size = evaluate_constant_u32(ops[op_idx + 1]); \
 			if (get_execution_model() != ExecutionModelFragment || msl_options.supports_msl_version(2, 2)) \
 				add_spv_func_and_recompile(SPVFuncImplSubgroupClustered##op); \
-			emit_subgroup_cluster_op(result_type, id, cluster_size, ops[op_idx], #msl_op); \
+			if (get<SPIRType>(result_type).basetype == SPIRType::Double || \
+			    get<SPIRType>(result_type).basetype == SPIRType::Float) \
+				emit_subgroup_scan_op(result_type, id, ops[op_idx], OpGroupNonUniform##op, false, \
+				                      SPIRType::Unknown, cluster_size); \
+			else \
+				emit_subgroup_cluster_op(result_type, id, cluster_size, ops[op_idx], #msl_op); \
 		} \
 		else \
 			SPIRV_CROSS_THROW("Invalid group operation."); \
@@ -20046,10 +20328,9 @@ case OpGroupNonUniform##op: \
 		auto operation = static_cast<GroupOperation>(ops[op_idx++]); \
 		if (operation == GroupOperationReduce) \
 			emit_unary_func_op_cast(result_type, id, ops[op_idx], "simd_" #msl_op, type, type); \
-		else if (operation == GroupOperationInclusiveScan) \
-			SPIRV_CROSS_THROW("Metal doesn't support InclusiveScan for OpGroupNonUniform" #op "."); \
-		else if (operation == GroupOperationExclusiveScan) \
-			SPIRV_CROSS_THROW("Metal doesn't support ExclusiveScan for OpGroupNonUniform" #op "."); \
+		else if (operation == GroupOperationInclusiveScan || operation == GroupOperationExclusiveScan) \
+			emit_subgroup_scan_op(result_type, id, ops[op_idx], OpGroupNonUniform##op, \
+			                      operation == GroupOperationInclusiveScan, type); \
 		else if (operation == GroupOperationClusteredReduce) \
 		{ \
 			uint32_t cluster_size = evaluate_constant_u32(ops[op_idx + 1]); \
@@ -20120,6 +20401,126 @@ void CompilerMSL::emit_subgroup_cluster_op(uint32_t result_type, uint32_t result
 	        join("spvClustered_", op, "<", cluster_size, ">(", to_unpacked_expression(op0), ", ",
 	             to_expression(builtin_subgroup_invocation_id_id), ")"),
 	        forward);
+	inherit_expression_dependencies(result_id, op0);
+}
+
+// The element an interface member flattened from an array or matrix stands for
+string CompilerMSL::interface_element_access(uint32_t type_id, uint32_t index) const
+{
+	uint32_t e = get_extended_member_decoration(type_id, index, SPIRVCrossDecorationInterfaceElement);
+	uint32_t cols = get_extended_member_decoration(type_id, index, SPIRVCrossDecorationInterfaceElementColumns);
+
+	if (e == 0)
+		return "";
+
+	e--;
+	return cols ? join("[", e / cols, "][", e % cols, "]") : join("[", e, "]");
+}
+
+void CompilerMSL::emit_subgroup_float_op(uint32_t result_type, uint32_t result_id, uint32_t op0, const char *op)
+{
+	auto &type = get<SPIRType>(result_type);
+	bool is_float = type.basetype == SPIRType::Float || type.basetype == SPIRType::Half;
+
+	if (type.basetype == SPIRType::Double && strncmp(op, "prefix_", 7) == 0)
+	{
+		bool product = strstr(op, "product") != nullptr;
+		emit_subgroup_scan_op(result_type, result_id, op0, product ? OpGroupNonUniformFMul : OpGroupNonUniformFAdd,
+		                      strstr(op, "inclusive") != nullptr, SPIRType::Unknown);
+		return;
+	}
+
+	if (is_float)
+		add_spv_func_and_recompile(SPVFuncImplSubgroupFloatReduce);
+
+	emit_unary_func_op(result_type, result_id, op0, join(is_float ? "spvSimd_" : "simd_", op).c_str());
+}
+
+void CompilerMSL::emit_subgroup_scan_op(uint32_t result_type, uint32_t result_id, uint32_t op0, Op op,
+                                        bool inclusive, SPIRType::BaseType cast_type, uint32_t cluster_size)
+{
+	add_spv_func_and_recompile(SPVFuncImplSubgroupScan);
+
+	auto &rtype = get<SPIRType>(result_type);
+	bool logical = op == OpGroupNonUniformLogicalAnd || op == OpGroupNonUniformLogicalOr ||
+	               op == OpGroupNonUniformLogicalXor;
+	SPIRType vtype = rtype;
+	if (cast_type != SPIRType::Unknown)
+	{
+		vtype.basetype = cast_type;
+		if (logical)
+			vtype.width = 16;
+	}
+	SPIRType stype = vtype;
+	stype.vecsize = 1;
+	stype.columns = 1;
+	string vname = type_to_glsl(vtype);
+	string sname = type_to_glsl(stype);
+	bool is_float = vtype.basetype == SPIRType::Float || vtype.basetype == SPIRType::Half;
+
+	const char *fn = nullptr;
+	string ident;
+	bool fp64 = vtype.basetype == SPIRType::Double;
+	switch (op)
+	{
+	case OpGroupNonUniformFAdd:
+	case OpGroupNonUniformIAdd:
+		fn = "spvScanAdd";
+		ident = fp64 ? "0.0f" : "0";
+		break;
+	case OpGroupNonUniformFMul:
+	case OpGroupNonUniformIMul:
+		fn = "spvScanMul";
+		ident = fp64 ? "1.0f" : "1";
+		break;
+	case OpGroupNonUniformFMin:
+	case OpGroupNonUniformSMin:
+	case OpGroupNonUniformUMin:
+		fn = "spvScanMin";
+		ident = fp64 ? "INFINITY" :
+		        is_float ? join("numeric_limits<", sname, ">::infinity()") : join("numeric_limits<", sname, ">::max()");
+		break;
+	case OpGroupNonUniformFMax:
+	case OpGroupNonUniformSMax:
+	case OpGroupNonUniformUMax:
+		fn = "spvScanMax";
+		ident = fp64 ? "-INFINITY" :
+		        is_float ? join("-numeric_limits<", sname, ">::infinity()") : join("numeric_limits<", sname, ">::lowest()");
+		break;
+	case OpGroupNonUniformBitwiseAnd:
+		fn = "spvScanAnd";
+		ident = join("~", sname, "(0)");
+		break;
+	case OpGroupNonUniformLogicalAnd:
+		fn = "spvScanAnd";
+		ident = "1";
+		break;
+	case OpGroupNonUniformBitwiseOr:
+	case OpGroupNonUniformLogicalOr:
+		fn = "spvScanOr";
+		ident = "0";
+		break;
+	case OpGroupNonUniformBitwiseXor:
+	case OpGroupNonUniformLogicalXor:
+		fn = "spvScanXor";
+		ident = "0";
+		break;
+	default:
+		SPIRV_CROSS_THROW("Invalid scan operation.");
+	}
+
+	string value = to_unpacked_expression(op0);
+	if (cast_type != SPIRType::Unknown)
+		value = join(vname, "(", value, ")");
+
+	string identity = fp64 ? join("spvFp64Splat<", vname, ">(", ident, ")") : join(vname, "(", ident, ")");
+	string tail = cluster_size ? join(cluster_size, "u") : string(inclusive ? "true" : "false");
+	string expr = join(cluster_size ? "spvSubgroupClusterReduce<" : "spvSubgroupScan<", fn, ">(", value, ", ",
+	                   identity, ", ", to_expression(builtin_subgroup_invocation_id_id), ", ", tail, ")");
+	if (cast_type != SPIRType::Unknown)
+		expr = join(type_to_glsl(rtype), "(", expr, ")");
+
+	emit_op(result_type, result_id, expr, should_forward(op0));
 	inherit_expression_dependencies(result_id, op0);
 }
 
@@ -21318,6 +21719,12 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 			needs_subgroup_invocation_id = true;
 		break;
 
+	case OpGroupNonUniformShuffleXor:
+	case OpGroupNonUniformShuffleUp:
+	case OpGroupNonUniformShuffleDown:
+		needs_subgroup_invocation_id = true;
+		break;
+
 	case OpGroupNonUniformRotateKHR:
 		// Add the correct invocation ID for calculating clustered rotate case.
 		if (length > 5)
@@ -21345,9 +21752,10 @@ bool CompilerMSL::OpCodePreprocessor::handle(Op opcode, const uint32_t *args, ui
 	case OpGroupNonUniformLogicalAnd:
 	case OpGroupNonUniformLogicalOr:
 	case OpGroupNonUniformLogicalXor:
-		if ((compiler.get_execution_model() != ExecutionModelFragment ||
-		     self.msl_options.supports_msl_version(2, 2)) &&
-		    args[3] == GroupOperationClusteredReduce)
+		if (((compiler.get_execution_model() != ExecutionModelFragment ||
+		      self.msl_options.supports_msl_version(2, 2)) &&
+		     args[3] == GroupOperationClusteredReduce) ||
+		    args[3] == GroupOperationInclusiveScan || args[3] == GroupOperationExclusiveScan)
 			needs_subgroup_invocation_id = true;
 		break;
 
@@ -22956,6 +23364,7 @@ void CompilerMSL::emit_mesh_outputs()
 				}
 			}
 
+			access += interface_element_access(type_vert.self, index);
 			statement("spvV.", to_member_name(type_vert, index), " = ", to_name(orig_var), "[spvVI]", access, ";");
 			if (options.vertex.flip_vert_y && builtin == BuiltInPosition)
 			{
@@ -23035,6 +23444,7 @@ void CompilerMSL::emit_mesh_outputs()
 						access = "." + to_member_name(orig_type, orig_id);
 					}
 				}
+				access += interface_element_access(type_prim.self, index);
 				statement("spvP.", to_member_name(type_prim, index), " = ", to_name(orig_var), "[spvPI]", access, ";");
 			}
 			statement("spvMesh.set_primitive(spvPI, spvP);");
