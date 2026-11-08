@@ -31,6 +31,7 @@
 using namespace SPIRV_CROSS_SPV_HEADER_NAMESPACE;
 using namespace SPIRV_CROSS_NAMESPACE;
 using namespace std;
+static string sparse_zero_texel(const SPIRType &img, const string &type_name, uint32_t vecsize);
 
 static const uint32_t k_unknown_location = ~0u;
 static const uint32_t k_unknown_component = ~0u;
@@ -11429,11 +11430,34 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 			string expr = join(to_expression(img_id), ".read(uint2(", coord, ".xy), ", layer, ")");
 			if (rtype.vecsize < 4)
 				expr += vector_swizzle(rtype.vecsize, 0);
+			string guard = sparse_image_guard(img_id, ops[3]);
+			if (!guard.empty())
+				expr = join("(", guard, " ? ", sparse_zero_texel(get<SPIRType>(type.self), type_to_glsl(rtype), rtype.vecsize),
+				            " : ", expr, ")");
 			emit_op(ops[0], ops[1], expr, false);
 			break;
 		}
 
-		emit_texture_op(instruction, false);
+		{
+			string guard = sparse_image_guard(img_id, ops[3]);
+			emit_texture_op(instruction, false);
+			// an uncommitted texel reads as zero
+			if (!guard.empty())
+			{
+				auto &rtype = get<SPIRType>(ops[0]);
+				bool done = to_expression(ops[1]) == to_name(ops[1]);
+				string read = to_enclosed_expression(ops[1]);
+				string guarded = join("(", guard, " ? ",
+				                      sparse_zero_texel(get<SPIRType>(type.self), type_to_glsl(rtype), rtype.vecsize),
+				                      " : ", read, ")");
+				// the read happens here, not later where it is used: a write
+				// to the image may come in between
+				if (done)
+					set<SPIRExpression>(ops[1], guarded, ops[0], false);
+				else
+					emit_op(ops[0], ops[1], guarded, false);
+			}
+		}
 		break;
 	}
 
@@ -11475,6 +11499,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 				string c = join("(", coord, ")");
 				coord = join("uint3(", c, ".xy, ", ms_storage_layer(ops[2], c, ops[4], ptr_img.image.arrayed), ")");
 			}
+			string guard = sparse_image_guard(ops[2], ops[3]);
+			if (!guard.empty())
+				texel_pointer_guards[id] = guard;
 			auto &e =
 				set<SPIRExpression>(id, join(to_expression(ops[2]), "@", coord),
 				                    result_type, true);
@@ -11541,7 +11568,9 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 				sample = *opt;
 			string coord = to_enclosed_expression(coord_id);
 			string layer = sample ? ms_storage_layer(img_id, coord, sample, img_type.image.arrayed) : string("0u");
-			statement(to_expression(img_id), ".write(", remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)),
+			string guard = sparse_image_guard(img_id, coord_id);
+			statement(guard.empty() ? string() : join("if (!", guard, ") "),
+			          to_expression(img_id), ".write(", remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)),
 			          ", uint2(", coord, ".xy), ", layer, ");");
 			if (p_var && variable_storage_is_aliased(*p_var))
 				flush_all_aliased_variables();
@@ -11556,8 +11585,12 @@ void CompilerMSL::emit_instruction(const Instruction &instruction)
 		args.lod = lod;
 
 		string expr;
+		string guard = sparse_image_guard(img_id, coord_id);
+		// a write to an uncommitted texel goes nowhere
+		if (!guard.empty())
+			expr = join("if (!", guard, ") ");
 		if (needs_frag_discard_checks())
-			expr = join("(", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ((void)0) : ");
+			expr += join("(", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ((void)0) : ");
 		expr += join(to_expression(img_id), ".write(",
 		             remap_swizzle(store_type, texel_type.vecsize, to_expression(texel_id)), ", ",
 		             CompilerMSL::to_function_args(args, &forward), ")");
@@ -13150,6 +13183,17 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, 
 	bool check_discard = opcode != OpAtomicLoad && needs_frag_discard_checks() &&
 	                     ptr_type.storage != StorageClassWorkgroup;
 
+	// MGL: an atomic on an uncommitted texel does nothing and returns zero
+	string keep;
+	if (check_discard)
+		keep = join("!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput));
+	{
+		auto g = texel_pointer_guards.find(obj);
+		if (g != texel_pointer_guards.end())
+			keep += join(keep.empty() ? "" : " && ", "!", g->second);
+	}
+	check_discard = !keep.empty();
+
 	// Even compare exchange atomics are vec4 on metal for ... reasons :v
 	uint32_t vec4_temporary_id = 0;
 	if (use_native_image_atomic && is_atomic_compare_exchange_strong)
@@ -13175,11 +13219,11 @@ void CompilerMSL::emit_atomic_func_op(uint32_t result_type, uint32_t result_id, 
 			emit_uninitialized_temporary_expression(result_type, result_id);
 			if (vec4_temporary_id)
 				emit_uninitialized_temporary_expression(vec4_temporary_id + 1, vec4_temporary_id);
-			statement("if (!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), ")");
+			statement("if (", keep, ")");
 			begin_scope();
 		}
 		else
-			exp = join("(!", builtin_to_glsl(BuiltInHelperInvocation, StorageClassInput), " ? ");
+			exp = join("((", keep, ") ? ");
 	}
 
 	if (use_native_image_atomic)
@@ -15171,6 +15215,65 @@ string CompilerMSL::texture_param_expression(uint32_t img)
 }
 
 // MGL: an image passed to a helper function carries its spvTexParam alongside
+// MGL: what reading a zero texel of the image's format gives: the
+// channels it stores are 0, and a missing alpha reads as 1
+static string sparse_zero_texel(const SPIRType &img, const string &type_name, uint32_t vecsize)
+{
+	bool four = false;
+	switch (img.image.format)
+	{
+	case ImageFormatRgba32f: case ImageFormatRgba16f: case ImageFormatRgba8: case ImageFormatRgba8Snorm:
+	case ImageFormatRgba16: case ImageFormatRgba16Snorm: case ImageFormatRgb10A2: case ImageFormatRgba32i:
+	case ImageFormatRgba16i: case ImageFormatRgba8i: case ImageFormatRgba32ui: case ImageFormatRgba16ui:
+	case ImageFormatRgba8ui: case ImageFormatRgb10a2ui:
+		four = true;
+		break;
+	default:
+		break;
+	}
+	if (vecsize < 4 || four)
+		return join(type_name, "(0)");
+	return join(type_name, "(0, 0, 0, 1)");
+}
+
+// MGL: true when the storage image texel at coord sits on an uncommitted page
+string CompilerMSL::sparse_image_guard(uint32_t img, uint32_t coord)
+{
+	if (!msl_options.sparse_image_guards || !coord)
+		return "";
+
+	auto &type = expression_type(img);
+	if (type.basetype != SPIRType::Image || type.image.sampled != 2 || type.image.dim == DimBuffer ||
+	    type.image.dim == DimSubpassData)
+		return "";
+
+	// a write behind a branch loses the raster order group's ordering
+	auto *var = maybe_get_backing_variable(img);
+	if (var && interlocked_resources.count(var->self))
+		return "";
+
+	string p = texture_param_expression(img);
+	if (p.empty())
+		return "";
+
+	add_typedef_line("static inline bool spvPageMissing(constant spvTexParam& p, int4 c) { if (p.pad.y == 0u) "
+	                 "return false; constant uint* h = (constant uint*)&p + p.pad.y; uint x = uint(c.x) / h[0], "
+	                 "y = uint(c.y) / h[1], z = (uint(c.z) + h[6]) / h[2]; if (x >= h[3] || y >= h[4] || z >= h[5]) "
+	                 "return false; uint i = x + h[3] * (y + h[4] * z); return ((h[7 + i / 32u] >> (i % 32u)) & 1u) == 0u; }");
+
+	auto &ct = expression_type(coord);
+	string c = to_enclosed_expression(coord);
+	string c4;
+	switch (ct.vecsize)
+	{
+	case 1: c4 = join("int4(int(", c, "), 0, 0, 0)"); break;
+	case 2: c4 = join("int4(int2(", c, "), 0, 0)"); break;
+	case 3: c4 = join("int4(int3(", c, "), 0)"); break;
+	default: c4 = join("int4(", c, ")"); break;
+	}
+	return join("spvPageMissing(", p, ", ", c4, ")");
+}
+
 bool CompilerMSL::has_texture_param_arg(const SPIRType &type, uint32_t id) const
 {
 	return msl_options.texture_params &&
@@ -18407,10 +18510,10 @@ void CompilerMSL::fix_up_shader_inputs_outputs()
 				});
 				break;
 			case BuiltInDrawIndex:
-				// in the variable's own type, which a function taking it by
-				// reference has to match
+				// in the type argument_decl gives a function taking it by reference
 				entry_func.fixup_hooks_in.push_back([=]() {
-					string t = type_to_glsl(get_variable_data_type(get<SPIRVariable>(var_id)));
+					string t = is_mesh_shader() ? type_to_glsl(get_variable_data_type(get<SPIRVariable>(var_id))) :
+					                              builtin_type_decl(BuiltInDrawIndex);
 					statement(t, " ", to_expression(var_id), " = ", t, "(*", to_expression(draw_index_buffer_id), ");");
 				});
 				break;
@@ -23370,6 +23473,16 @@ void CompilerMSL::emit_mesh_outputs()
 			{
 				statement("spvV.", to_member_name(type_vert, index), ".y = -(", "spvV.",
 				          to_member_name(type_vert, index), ".y);", "    // Invert Y-axis for Metal");
+			}
+			// MGL: the same depth fix-up as a vertex function's
+			if (options.vertex.fixup_clipspace && builtin == BuiltInPosition)
+			{
+				string pos = "spvV." + to_member_name(type_vert, index);
+				if (msl_options.runtime_clip_depth)
+					statement("#ifndef SPV_CLIP_ZERO_TO_ONE");
+				statement(pos, ".z = (", pos, ".z + ", pos, ".w) * 0.5;       // Adjust clip-space for Metal");
+				if (msl_options.runtime_clip_depth)
+					statement("#endif");
 			}
 		}
 		statement("spvMesh.set_vertex(spvVI, spvV);");

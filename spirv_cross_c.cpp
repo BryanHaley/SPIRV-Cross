@@ -808,6 +808,10 @@ spvc_result spvc_compiler_options_set_uint(spvc_compiler_options options, spvc_c
 		options->msl.texture_params_buffer_index = value;
 		break;
 
+	case SPVC_COMPILER_OPTION_MSL_SPARSE_IMAGE_GUARDS:
+		options->msl.sparse_image_guards = value != 0;
+		break;
+
 	case SPVC_COMPILER_OPTION_MSL_FLOAT_TESS_FACTORS:
 		options->msl.float_tess_factors = value != 0;
 		break;

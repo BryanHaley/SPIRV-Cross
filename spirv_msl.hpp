@@ -578,6 +578,11 @@ public:
 		// this buffer slot, indexed by the texture's Metal slot.
 		bool texture_params = false;
 
+		// MGL: storage image reads, writes and atomics first ask whether the
+		// texel's page is committed, from a page map the spvTexParam points to
+		// (pad.y words on from it; 0 for a unit that is not sparse)
+		bool sparse_image_guards = false;
+
 		// MGL: tessellation factors written as floats in quad layout, for a
 		// control stage whose levels are read by MGL rather than Metal
 		bool float_tess_factors = false;
@@ -1401,6 +1406,8 @@ protected:
 	bool used_swizzle_buffer = false;
 	bool used_texture_params = false;
 	std::string texture_param_expression(uint32_t img);
+	std::string sparse_image_guard(uint32_t img, uint32_t coord);
+	std::unordered_map<uint32_t, std::string> texel_pointer_guards; // MGL: texel pointer -> sparse guard
 	bool has_texture_param_arg(const SPIRType &type, uint32_t id) const;
 	void add_texture_param_typedefs();
 	bool is_ms_storage_layers(const SPIRType &type) const;
