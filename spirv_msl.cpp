@@ -15392,7 +15392,55 @@ string CompilerMSL::to_texture_op(const Instruction &i, bool sparse, bool *forwa
 				c3 = join("float3(", coord, ".xy, 0.5)");
 			else
 				c3 = join("float3(", coord, ".xyz)");
-			inner_expr = join("spvTexBorder(", inner_expr, ", ", param, ", ", c3, ")");
+			if (result_type.basetype == SPIRType::Float || result_type.basetype == SPIRType::Half)
+			{
+				// MGL: sampled against a transparent black border, plus the border
+				// colour by how much of the filter footprint fell outside, which
+				// is exact for any linear filter
+				add_typedef_line("static inline float spvBorderAxis(float c, float n, bool lin, bool pix) "
+				                 "{ float u = pix ? c : c * n; if (!lin) return (u >= 0.0 && u < n) ? 1.0 : 0.0; "
+				                 "u -= 0.5; float i0 = floor(u); float f = u - i0; "
+				                 "return ((i0 >= 0.0 && i0 < n) ? 1.0 - f : 0.0) + ((i0 + 1.0 >= 0.0 && i0 + 1.0 < n) ? f : 0.0); }");
+				add_typedef_line("static inline float spvBorderCover(constant spvTexParam& p, float3 c, float3 sz, bool lin, "
+				                 "bool pix) { float k = 1.0; if ((p.border & 1u) != 0u) k *= spvBorderAxis(c.x, sz.x, lin, pix); "
+				                 "if ((p.border & 2u) != 0u) k *= spvBorderAxis(c.y, sz.y, lin, pix); "
+				                 "if ((p.border & 4u) != 0u) k *= spvBorderAxis(c.z, sz.z, lin, pix); return k; }");
+				add_typedef_line("template<typename T> inline vec<T, 4> spvTexBorderF(vec<T, 4> v, constant spvTexParam& p, "
+				                 "float3 c, float3 sz, float lod, float levels) { if ((p.border & 7u) == 0u) return v; "
+				                 "bool pix = (p.border & 512u) != 0u; float k; "
+				                 "if (lod <= 0.0) k = spvBorderCover(p, c, sz, (p.border & 16u) != 0u, pix); "
+				                 "else { bool lin = (p.border & 32u) != 0u; uint mip = (p.border >> 6) & 3u; "
+				                 "float l = mip == 0u ? 0.0 : clamp(lod, 0.0, max(levels - 1.0, 0.0)); "
+				                 "float l0 = mip == 1u ? floor(l + 0.5) : floor(l); "
+				                 "k = spvBorderCover(p, c, max(floor(sz / exp2(l0)), float3(1.0)), lin, pix); "
+				                 "if (mip == 2u && l0 + 1.0 <= levels - 1.0) k = mix(k, spvBorderCover(p, c, "
+				                 "max(floor(sz / exp2(l0 + 1.0)), float3(1.0)), lin, pix), l - l0); } "
+				                 "return vec<T, 4>(float4(v) + as_type<float4>(p.borderBits) * (1.0 - k)); }");
+
+				string tex = to_expression(img);
+				bool one_d = imgtype.image.dim == Dim1D, rect = imgtype.image.dim == DimRect;
+				bool three_d = imgtype.image.dim == Dim3D;
+				string sz = one_d ? join("float3(float(", tex, ".get_width()), 1.0, 1.0)") :
+				            three_d ? join("float3(float(", tex, ".get_width()), float(", tex, ".get_height()), float(",
+				                           tex, ".get_depth()))") :
+				                      join("float3(float(", tex, ".get_width()), float(", tex, ".get_height()), 1.0)");
+				string levels = (one_d || rect) ? string("1.0") : join("float(", tex, ".get_num_mip_levels())");
+				string lod = "0.0";
+				if (one_d || rect)
+					lod = "0.0";
+				else if (op == OpImageSampleExplicitLod)
+				{
+					if (i.length > 5 && (ops[4] & ImageOperandsLodMask))
+						lod = join("float(", to_expression(ops[5]), ")");
+				}
+				else if (get_execution_model() == ExecutionModelFragment)
+					lod = join(tex, ".calculate_unclamped_lod(", to_sampler_expression(img), ", ", coord,
+					           three_d ? ".xyz)" : ".xy)");
+				inner_expr = join("spvTexBorderF(", inner_expr, ", ", param, ", ", c3, ", ", sz, ", ", lod, ", ",
+				                  levels, ")");
+			}
+			else
+				inner_expr = join("spvTexBorder(", inner_expr, ", ", param, ", ", c3, ")");
 		}
 	}
 
