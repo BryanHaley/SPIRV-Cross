@@ -5734,7 +5734,10 @@ void CompilerMSL::mark_scalar_layout_structs(const SPIRType &type)
 			{
 				msl_size = get_declared_struct_size_msl(*struct_type);
 
-				if (array_stride > msl_size)
+				// MGL: packing a member later can still shrink the struct, so its
+				// native stride is noted even when it fits, and set again once
+				// the struct is aligned.
+				if (array_stride >= msl_size)
 				{
 					set_decoration(struct_type->self, DecorationArrayStride, msl_size);
 					add_spv_func_and_recompile(SPVFuncImplPaddedArrayElement);
@@ -5852,7 +5855,9 @@ bool CompilerMSL::validate_member_packing_rules_msl(const SPIRType &type, uint32
 		// This comes from DX scalar layout workaround.
 		// If app tries to be cheeky and access the member out of bounds, this will not work, but this is the best we can do.
 		// In OpAccessChain with logical memory models, access chains must be in-bounds in SPIR-V specification.
-		bool relax_array_stride = mbr_type.array.back() == 1 && mbr_type.array_size_literal.back();
+		// MGL: only a one-dimensional array; in "b[1][8]" the inner stride still counts
+		bool relax_array_stride = mbr_type.array.size() == 1 && mbr_type.array.back() == 1 &&
+		                          mbr_type.array_size_literal.back();
 		bool is_plain_struct = !mbr_type.pointer && mbr_type.basetype == SPIRType::Struct;
 
 		// Array of struct is padded on-demand.
@@ -9875,7 +9880,12 @@ void CompilerMSL::emit_specialization_constants_and_structs()
 				declared_structs.insert(type_id);
 
 				if (has_extended_decoration(type_id, SPIRVCrossDecorationBufferBlockRepacked))
+				{
 					align_struct(type, aligned_structs);
+
+					if (has_decoration(type_id, DecorationArrayStride))
+						set_decoration(type_id, DecorationArrayStride, get_declared_struct_size_msl(type));
+				}
 
 				// Make sure we declare the underlying struct type, and not the "decorated" type with pointers, etc.
 				emit_struct(get<SPIRType>(type_id));
@@ -19421,6 +19431,27 @@ const std::unordered_set<std::string> &CompilerMSL::get_illegal_func_names()
 		"float8",
 		"float16",
 		"signed",
+
+		// metal_functional's function objects, which a function of the same name makes ambiguous
+		"plus",
+		"minus",
+		"multiplies",
+		"divides",
+		"modulus",
+		"negate",
+		"equal_to",
+		"not_equal_to",
+		"greater",
+		"less",
+		"greater_equal",
+		"less_equal",
+		"logical_and",
+		"logical_or",
+		"logical_not",
+		"bit_and",
+		"bit_or",
+		"bit_xor",
+		"bit_not",
 	};
 
 	return illegal_func_names;
